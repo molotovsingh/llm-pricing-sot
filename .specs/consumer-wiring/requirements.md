@@ -76,7 +76,7 @@ Use stable IDs and testable EARS-style statements.
 ## Dependencies and Constraints
 
 - `llm-cost-estimator` repo at `~/llm-cost-estimator` — `load_pricing()` in `estimate_llm_cost.py` (currently defaults to `HERE/data/pricing.json`); its existing validation requires a `tokenizer` and finite non-negative `in`/`out`.
-- Pipeline repo at `~/projectless/llm-pricing-sot` — `fetch_pricing.py` (CLI) and `cache/pricing.json` (merged output).
+- Pipeline repo at `~/llm/llm-pricing-sot` — `fetch_pricing.py` (CLI) and `cache/pricing.json` (merged output).
 - `fetch_pricing.py` exit codes: `0` fresh / `1` stale / `2` no usable cache.
 - Consumers read cache via a configured path to the pipeline repo (env var or CLI flag); no hard-coded repo location.
 - Python 3.9+; subprocess invocation of `virtualenv`/`python` assumed available to the consumer.

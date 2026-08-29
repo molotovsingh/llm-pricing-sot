@@ -9,7 +9,7 @@ Design: `./design.md`
 
 ## Implementation Plan
 
-Only include implementation tasks after requirements and design are accepted. Keep tasks small, ordered, and traceable. The consumer lives at `~/llm-cost-estimator` (`estimate_llm_cost.py`, `tests/`); the pipeline repo is `~/projectless/llm-pricing-sot`.
+Only include implementation tasks after requirements and design are accepted. Keep tasks small, ordered, and traceable. The consumer lives at `~/llm/llm-cost-estimator` (`estimate_llm_cost.py`, `tests/`); the pipeline repo is `~/llm/llm-pricing-sot`.
 
 - [x] 1. Document the read/refresh contract in the pipeline README
   - ID: T-001
@@ -69,7 +69,7 @@ Only include implementation tasks after requirements and design are accepted. Ke
   - ID: T-010
   - Requirement(s): FR-002, FR-003
   - Files/areas: `~/llm-cost-estimator/estimate_llm_cost.py`, pipeline `cache/pricing.json`
-  - Validation: run `estimate_llm_cost.py --pricing-dir ~/projectless/llm-pricing-sot <input>`; confirm prices come from the cache and a stale cache triggers refresh.
+  - Validation: run `estimate_llm_cost.py --pricing-dir ~/llm/llm-pricing-sot <input>`; confirm prices come from the cache and a stale cache triggers refresh.
 
 - [x] 11. Confirm the pipeline is unchanged
   - ID: T-011

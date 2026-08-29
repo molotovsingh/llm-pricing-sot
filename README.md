@@ -88,7 +88,7 @@ Merged model entry shape (planned, matches llm-cost-estimator's expectations):
 ## Build order (when this repo graduates from design to code)
 
 1. `fetch_pricing.py` — two GETs (OpenRouter models API, LiteLLM raw JSON), merge with precedence overrides > LiteLLM > OpenRouter, emit cache + freshness metadata, staleness flag on failure.
-2. `overrides.json` — seed from `~/llm-cost-estimator/data/pricing.json`.
+2. `overrides.json` — seed from `~/llm/llm-cost-estimator/data/pricing.json`.
 3. Tests — merge precedence, TTL logic, stale-fallback path, schema validation (mirror llm-cost-estimator's pricing validation).
 4. Wire consumers — point llm-cost-estimator at the merged cache; document the read path for Hermes/Pi agents.
 
