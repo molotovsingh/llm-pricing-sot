@@ -1,0 +1,13 @@
+# Generated pipeline output: regenerate with fetch_pricing.py
+cache/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Editor / OS
+.DS_Store
+
+# Pi agent local session state
+.pi/
