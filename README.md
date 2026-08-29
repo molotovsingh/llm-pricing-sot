@@ -2,7 +2,7 @@
 
 Single source of truth for LLM pricing, shared by Hermes, Pi, and `llm-cost-estimator`.
 
-**Status: pipeline built; consumer wiring documented.** `fetch_pricing.py`, `overrides.json`, and `cache/pricing.json` exist; the stdlib-only CLI fetches on demand, merges by precedence (overrides > LiteLLM > OpenRouter), and emits a TTL-gated cache with freshness metadata. Specs live in `.specs/llm-pricing-pipeline/` (the pipeline) and `.specs/consumer-wiring/` (how consumers read it). Consumers are wired per the contract below.
+**Status: pipeline built; consumer wiring documented.** `fetch_pricing.py`, `overrides.json`, and `cache/pricing.json` exist; the stdlib-only CLI fetches on demand, merges by precedence (overrides > LiteLLM > OpenRouter), and emits a TTL-gated cache with freshness metadata. Consumers are wired per the contract below.
 
 ## Problem
 
