@@ -8,8 +8,10 @@ Stdlib-only (Python 3.9+). Implements tasks T-001..T-008 from .specs/llm-pricing
 """
 
 import argparse
+import contextlib
 import json
 import os
+import re
 import sys
 import urllib.request
 from datetime import datetime, timezone
@@ -23,6 +25,7 @@ INVOCATION_SCRIPT_DIR = _SCRIPT_DIR
 # from any directory, e.g. as a subprocess from a consumer repo).
 OVERRIDES_PATH = os.path.join(_SCRIPT_DIR, "overrides.json")
 CACHE_PATH = os.path.join(_SCRIPT_DIR, "cache", "pricing.json")
+DISCOVERY_PATH = os.path.join(_SCRIPT_DIR, "cache", "discovery.json")
 
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 LITELLM_PRICES_URL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
@@ -47,6 +50,15 @@ def parse_args(argv=None):
         type=int,
         default=DEFAULT_TTL_HOURS,
         help="Override the freshness TTL in hours (default: %(default)s).",
+    )
+    sub = parser.add_subparsers(dest="command")
+    q = sub.add_parser("query", help="run pricing queries (price, cheapest, list, fresh)")
+    q.add_argument("action", choices=["price", "cheapest", "list", "fresh"], help="query action")
+    q.add_argument("model", nargs="?", default=None, help="model id (for price/cheapest)")
+    q.add_argument(
+        "--offline",
+        action="store_true",
+        help="never hit the network: serve cached/stale data or report not found",
     )
     return parser.parse_args(argv)
 
@@ -279,6 +291,7 @@ def _now_iso(now=None):
 
 def run(ttl_hours=DEFAULT_TTL_HOURS, force=False,
         cache_path=CACHE_PATH, overrides_path=OVERRIDES_PATH,
+        discovery_path=None,
         openrouter_url=OPENROUTER_MODELS_URL, litellm_url=LITELLM_PRICES_URL,
         openrouter_fetcher=_default_fetcher, litellm_fetcher=_default_fetcher,
         now=None):
@@ -316,6 +329,9 @@ def run(ttl_hours=DEFAULT_TTL_HOURS, force=False,
         if valid:
             payload = build_cache(valid, ttl_hours, _now_iso(now), "fresh")
             emit(payload, cache_path)
+            if discovery_path:
+                _emit_discovery(discovery_path, _now_iso(now),
+                                openrouter_layer or {}, litellm_layer or {}, ttl_hours)
             print(f"fetched fresh: {len(valid)} models")
             return 0
         # Refresh succeeded but nothing survived validation -> hard failure.
@@ -335,9 +351,197 @@ def run(ttl_hours=DEFAULT_TTL_HOURS, force=False,
     return 2
 
 
+# ---------------- query interface ----------------
+
+def _emit_discovery(path, fetched_at, openrouter_layer, litellm_layer,
+                    ttl_hours=DEFAULT_TTL_HOURS):
+    """Persist normalized discovery layers so fallback queries stay TTL-gated."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    payload = {
+        "fetched_at": fetched_at,
+        "ttl_hours": ttl_hours,
+        "openrouter": openrouter_layer or {},
+        "litellm": litellm_layer or {},
+    }
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, sort_keys=True)
+
+
+def _load_discovery(path=DISCOVERY_PATH):
+    """Load the discovery sidecar, or None if missing/corrupt/wrong shape."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if not isinstance(data.get("openrouter"), dict) or not isinstance(data.get("litellm"), dict):
+        return None
+    return data
+
+
+def ensure_discovery(offline, ttl_hours=DEFAULT_TTL_HOURS, now=None,
+                     openrouter_fetcher=_default_fetcher, litellm_fetcher=_default_fetcher,
+                     path=DISCOVERY_PATH):
+    """Return the discovery sidecar, refreshing it when stale unless offline.
+
+    Offline (or a failed fetch) returns the existing sidecar as-is, possibly None.
+    """
+    disc = _load_discovery(path)
+    if disc is not None and is_fresh(disc, ttl_hours, now=now):
+        return disc
+    if offline:
+        return disc
+    try:
+        openrouter_layer = fetch_openrouter(OPENROUTER_MODELS_URL, openrouter_fetcher)
+    except Exception:
+        openrouter_layer = None
+    try:
+        litellm_layer = fetch_litellm(LITELLM_PRICES_URL, litellm_fetcher)
+    except Exception:
+        litellm_layer = None
+    if openrouter_layer is None and litellm_layer is None:
+        return disc
+    _emit_discovery(path, _now_iso(now), openrouter_layer, litellm_layer, ttl_hours)
+    return _load_discovery(path)
+
+
+def _normalize_model(name):
+    """Normalize a model id for variant matching.
+
+    Lowercases, strips provider prefixes (everything before the last '/'), and
+    unifies version dashes (gemini-3-7 -> gemini-3.7). Batch suffixes (:batch)
+    are intentionally preserved so batch prices never match interactive prices.
+    """
+    text = name.lower().strip()
+    text = re.sub(r"(?<=\d)-(\d+)(?=$|[-.])", r".\1", text)
+    return text.rsplit("/", 1)[-1]
+
+
+def _variant_matches(model, entry_name):
+    """True if entry_name is a provider variant of model (normalized suffix match)."""
+    return _normalize_model(entry_name).endswith(_normalize_model(model))
+
+
+def _freshness_status(cache, ttl_hours, now):
+    if cache is None:
+        return "no-data"
+    return "fresh" if is_fresh(cache, ttl_hours, now=now) else "stale"
+
+
+def _exit_for(freshness):
+    return {"fresh": 0, "stale": 1, "no-data": 2}[freshness]
+
+
+def query_main(args, openrouter_fetcher=_default_fetcher, litellm_fetcher=_default_fetcher,
+               now=None, cache_path=CACHE_PATH, overrides_path=OVERRIDES_PATH,
+               discovery_path=DISCOVERY_PATH):
+    """Run a `query` subcommand. Prints JSON to stdout; returns an exit code.
+
+    Exit codes (FR-008): 0 fresh answer, 1 stale answer, 2 no data / not found.
+    """
+    offline = bool(getattr(args, "offline", False))
+    action = args.action
+    model = getattr(args, "model", None)
+    ttl_hours = DEFAULT_TTL_HOURS
+
+    def _refresh_cache_if_stale(cache):
+        if (cache is None or not is_fresh(cache, ttl_hours, now=now)) and not offline:
+            # Keep stdout clean for the JSON answer: refresh notes go to stderr.
+            with contextlib.redirect_stdout(sys.stderr):
+                run(ttl_hours=ttl_hours, force=True, cache_path=cache_path,
+                    overrides_path=overrides_path, discovery_path=discovery_path,
+                    openrouter_fetcher=openrouter_fetcher, litellm_fetcher=litellm_fetcher,
+                    now=now)
+            return _load_cache(cache_path)
+        return cache
+
+    def _out(payload, freshness):
+        print(json.dumps(payload, sort_keys=True))
+        return _exit_for(freshness)
+
+    cache = _load_cache(cache_path)
+    cache = _refresh_cache_if_stale(cache)
+    freshness = _freshness_status(cache, ttl_hours, now)
+    cache_models = (cache or {}).get("models", {}) if isinstance(cache, dict) else {}
+
+    if action == "fresh":
+        fetched_at = cache.get("fetched_at") if isinstance(cache, dict) else None
+        return _out({"freshness": freshness, "fetched_at": fetched_at,
+                     "ttl_hours": ttl_hours}, freshness)
+
+    disc = ensure_discovery(offline, ttl_hours, now,
+                            openrouter_fetcher, litellm_fetcher, discovery_path)
+    disc_freshness = ("fresh" if (disc is not None and is_fresh(disc, ttl_hours, now=now))
+                      else ("stale" if disc is not None else "no-data"))
+
+    if action == "list":
+        models = []
+        for mid, e in cache_models.items():
+            models.append({"model": mid, "in": e.get("in"), "out": e.get("out"),
+                           "source": e.get("source"), "baseline": False})
+        if disc is not None:
+            for layer_name in ("litellm", "openrouter"):
+                for mid, e in (disc.get(layer_name) or {}).items():
+                    if mid in cache_models:
+                        continue
+                    models.append({"model": mid, "in": e.get("in"), "out": e.get("out"),
+                                   "source": layer_name, "baseline": True})
+        status = freshness if freshness != "no-data" else disc_freshness
+        return _out({"freshness": freshness, "models": models}, status)
+
+    if model is None:
+        print(json.dumps({"error": "model argument required for %s" % action}), file=sys.stderr)
+        return 2
+
+    if action == "price":
+        if model in cache_models:
+            entry = dict(cache_models[model])
+            entry.update({"model": model, "baseline": False, "freshness": freshness})
+            return _out(entry, freshness)
+        if disc is not None:
+            # Prefer an exact id match over a provider variant.
+            for layer_name in ("litellm", "openrouter"):
+                layer = disc.get(layer_name) or {}
+                if model in layer:
+                    entry = dict(layer[model])
+                    entry.update({"model": model, "baseline": True, "freshness": disc_freshness})
+                    return _out(entry, disc_freshness)
+            for layer_name in ("litellm", "openrouter"):
+                for mid, e in (disc.get(layer_name) or {}).items():
+                    if _variant_matches(model, mid):
+                        entry = dict(e)
+                        entry.update({"model": mid, "baseline": True, "freshness": disc_freshness})
+                        return _out(entry, disc_freshness)
+        return _out({"model": model, "found": False, "freshness": freshness}, "no-data")
+
+    if action == "cheapest":
+        authoritative = dict(cache_models[model]) if model in cache_models else None
+        variants = []
+        if disc is not None:
+            for layer_name in ("litellm", "openrouter"):
+                for mid, e in (disc.get(layer_name) or {}).items():
+                    if (mid == model or _variant_matches(model, mid)) and "in" in e and "out" in e:
+                        variants.append({"provider": mid, "in": e["in"], "out": e["out"],
+                                         "source": layer_name})
+        if not variants:
+            return _out({"model": model, "found": False, "freshness": freshness}, "no-data")
+        cheapest = min(variants, key=lambda v: (v["in"], v["out"]))
+        return _out({"model": model, "provider": cheapest["provider"], "in": cheapest["in"],
+                     "out": cheapest["out"], "source": cheapest["source"], "baseline": True,
+                     "authoritative": authoritative, "variants": len(variants),
+                     "freshness": disc_freshness}, disc_freshness)
+
+    print(json.dumps({"error": "unknown action %r" % action}), file=sys.stderr)
+    return 2
+
+
 def main(argv=None):
-    """CLI entrypoint (resolves args, orchestrates, returns the exit code)."""
+    """CLI entrypoint (pipeline run, or `query` subcommands)."""
     args = parse_args(argv)
+    if getattr(args, "command", None) == "query":
+        return query_main(args)
     return run(ttl_hours=args.ttl_hours, force=args.force)
 
 

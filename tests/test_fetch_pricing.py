@@ -1,5 +1,6 @@
 """Unit tests for the fetch_pricing CLI argument parsing (T-001)."""
 
+import argparse
 import json
 import os
 import tempfile
@@ -20,8 +21,10 @@ from fetch_pricing import (
     load_overrides,
     merge,
     parse_args,
+    query_main,
     run,
     validate_entry,
+    _normalize_model,
 )
 
 
@@ -382,6 +385,192 @@ def setUpModule():
 def tearDownModule():
     if _network_guard is not None:
         _network_guard.stop()
+
+
+class QueryTestBase(unittest.TestCase):
+    """Shared fixtures for query tests: temp paths, fake fetchers, fixed clock."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cache_path = os.path.join(self.tmp.name, "cache", "pricing.json")
+        self.overrides_path = os.path.join(self.tmp.name, "overrides.json")
+        self.discovery_path = os.path.join(self.tmp.name, "cache", "discovery.json")
+        self.now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+    def _args(self, action, model=None, offline=False):
+        return argparse.Namespace(command="query", action=action, model=model, offline=offline)
+
+    def _write_cache(self, hours_ago, models=None, ttl=24):
+        payload = build_cache(
+            models or {"kimi-k3": {"in": 3.0, "out": 15.0, "tokenizer": "hf:x", "source": "override"}},
+            ttl,
+            (self.now - timedelta(hours=hours_ago)).isoformat(),
+            "fresh",
+        )
+        emit(payload, self.cache_path)
+
+    def _write_discovery(self, hours_ago, litellm=None, openrouter=None, ttl=24):
+        payload = {
+            "fetched_at": (self.now - timedelta(hours=hours_ago)).isoformat(),
+            "ttl_hours": ttl,
+            "litellm": litellm or {},
+            "openrouter": openrouter or {},
+        }
+        os.makedirs(os.path.dirname(self.discovery_path), exist_ok=True)
+        with open(self.discovery_path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+
+    def _run(self, action, model=None, offline=False, or_fetcher=None, ll_fetcher=None):
+        import contextlib, io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = query_main(
+                self._args(action, model, offline),
+                openrouter_fetcher=or_fetcher or self._raising,
+                litellm_fetcher=ll_fetcher or self._raising,
+                now=self.now,
+                cache_path=self.cache_path,
+                overrides_path=self.overrides_path,
+                discovery_path=self.discovery_path,
+            )
+        return code, json.loads(out.getvalue())
+
+    @staticmethod
+    def _raising(url):
+        raise AssertionError("network forbidden")
+
+
+class TestNormalizeModel(unittest.TestCase):
+    def test_provider_prefix_stripped(self):
+        self.assertEqual(_normalize_model("databricks/databricks-gemini-3-1-pro"), "databricks-gemini-3.1-pro")
+
+    def test_version_dash_unified(self):
+        self.assertEqual(_normalize_model("gemini-3-7-flash"), "gemini-3.7-flash")
+
+    def test_batch_suffix_preserved(self):
+        self.assertNotEqual(_normalize_model("google/gemini-3.7-flash:batch"),
+                            _normalize_model("google/gemini-3.7-flash"))
+
+
+class TestQueryPrice(QueryTestBase):
+    def test_cached_authoritative(self):
+        self._write_cache(1)
+        code, data = self._run("price", "kimi-k3", offline=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(data["in"], 3.0)
+        self.assertFalse(data["baseline"])
+        self.assertEqual(data["source"], "override")
+        self.assertEqual(data["freshness"], "fresh")
+
+    def test_discovery_fallback_labeled_baseline(self):
+        self._write_cache(1)
+        self._write_discovery(1, litellm={"google/gemini-3.7-flash": {"in": 0.75, "out": 3.75, "source": "litellm"}})
+        code, data = self._run("price", "gemini-3.7-flash", offline=True)
+        self.assertEqual(code, 0)
+        self.assertTrue(data["baseline"])
+        self.assertEqual(data["source"], "litellm")
+        self.assertNotIn("tokenizer", data)
+
+    def test_not_found_offline(self):
+        self._write_cache(1)
+        code, data = self._run("price", "no-such-model", offline=True)
+        self.assertEqual(code, 2)
+        self.assertFalse(data["found"])
+
+    def test_stale_cache_served_offline_exit1(self):
+        self._write_cache(48)
+        code, data = self._run("price", "kimi-k3", offline=True)
+        self.assertEqual(code, 1)
+        self.assertEqual(data["freshness"], "stale")
+
+    def test_auto_refresh_when_stale(self):
+        # No cache; online query with fake fetchers -> refresh writes the cache,
+        # then the answer comes back authoritative + fresh.
+        with open(self.overrides_path, "w", encoding="utf-8") as fh:
+            json.dump({"gpt-4o": {"tokenizer": "tiktoken:o200k_base"}}, fh)
+        or_fetcher = lambda u: json.dumps({"data": [{"id": "gpt-4o", "pricing": {"prompt": "0.000003", "completion": "0.00001"}}]})
+        ll_fetcher = lambda u: json.dumps({"gpt-4o": {"input_cost_per_token": 0.0000025, "output_cost_per_token": 0.00001}})
+        code, data = self._run("price", "gpt-4o", or_fetcher=or_fetcher, ll_fetcher=ll_fetcher)
+        self.assertEqual(code, 0)
+        self.assertEqual(data["in"], 2.5)
+        self.assertFalse(data["baseline"])
+        self.assertTrue(os.path.exists(self.cache_path))
+        self.assertTrue(os.path.exists(self.discovery_path))
+
+
+class TestQueryCheapest(QueryTestBase):
+    def test_variants_and_dash_naming(self):
+        self._write_cache(1)
+        self._write_discovery(1, litellm={
+            "databricks/databricks-gemini-3-1-pro": {"in": 2.5, "out": 15.0, "source": "litellm"},
+            "deepinfra/google/gemini-3.1-pro": {"in": 2.0, "out": 12.0, "source": "litellm"},
+            "google/gemini-3.1-pro": {"in": 2.0, "out": 12.0, "source": "litellm"},
+        })
+        code, data = self._run("cheapest", "gemini-3.1-pro", offline=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(data["in"], 2.0)
+        self.assertIn(data["provider"], ("deepinfra/google/gemini-3.1-pro", "google/gemini-3.1-pro"))
+        self.assertEqual(data["variants"], 3)
+
+    def test_no_variants_exit2(self):
+        self._write_cache(1)
+        code, data = self._run("cheapest", "no-such-model", offline=True)
+        self.assertEqual(code, 2)
+        self.assertFalse(data["found"])
+
+
+class TestQueryListFresh(QueryTestBase):
+    def test_list_labels_authoritative_and_baseline(self):
+        self._write_cache(1, models={"kimi-k3": {"in": 3.0, "out": 15.0, "tokenizer": "hf:x", "source": "override"}})
+        self._write_discovery(1, litellm={"google/gemini-3.7-flash": {"in": 0.75, "out": 3.75, "source": "litellm"}})
+        code, data = self._run("list", offline=True)
+        self.assertEqual(code, 0)
+        by_model = {m["model"]: m for m in data["models"]}
+        self.assertFalse(by_model["kimi-k3"]["baseline"])
+        self.assertTrue(by_model["google/gemini-3.7-flash"]["baseline"])
+
+    def test_fresh_action(self):
+        self._write_cache(1)
+        code, data = self._run("fresh", offline=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(data["freshness"], "fresh")
+        self.assertEqual(data["ttl_hours"], 24)
+
+    def test_fresh_stale_exit1(self):
+        self._write_cache(48)
+        code, data = self._run("fresh", offline=True)
+        self.assertEqual(code, 1)
+        self.assertEqual(data["freshness"], "stale")
+
+    def test_fresh_no_data_exit2(self):
+        code, data = self._run("fresh", offline=True)
+        self.assertEqual(code, 2)
+        self.assertEqual(data["freshness"], "no-data")
+
+
+class TestQueryOffline(QueryTestBase):
+    def test_offline_never_calls_fetchers(self):
+        # Raising fetchers: any network attempt would fail the test.
+        self._write_cache(1)
+        code, _ = self._run("price", "kimi-k3", offline=True)
+        self.assertEqual(code, 0)
+        code, _ = self._run("list", offline=True)
+        self.assertEqual(code, 0)
+        code, _ = self._run("fresh", offline=True)
+        self.assertEqual(code, 0)
+        code, _ = self._run("cheapest", "kimi-k3", offline=True)
+        self.assertIn(code, (0, 1, 2))
+
+    def test_online_unknown_model_fetches_discovery(self):
+        # Online query for an uncached model fetches discovery layers (fakes).
+        self._write_cache(1)
+        or_fetcher = lambda u: json.dumps({"data": []})
+        ll_fetcher = lambda u: json.dumps({"model-x": {"input_cost_per_token": 0.000001, "output_cost_per_token": 0.000002}})
+        code, data = self._run("price", "model-x", or_fetcher=or_fetcher, ll_fetcher=ll_fetcher)
+        self.assertEqual(code, 0)
+        self.assertTrue(data["baseline"])
+        self.assertTrue(os.path.exists(self.discovery_path))
 
 
 if __name__ == "__main__":
