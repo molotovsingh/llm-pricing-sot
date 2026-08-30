@@ -24,7 +24,9 @@ from fetch_pricing import (
     query_main,
     run,
     validate_entry,
+    _endpoint_snapshot_path,
     _normalize_model,
+    _normalize_openrouter,
 )
 
 
@@ -571,6 +573,132 @@ class TestQueryOffline(QueryTestBase):
         self.assertEqual(code, 0)
         self.assertTrue(data["baseline"])
         self.assertTrue(os.path.exists(self.discovery_path))
+
+
+class TestEndpointsCheapest(QueryTestBase):
+    """US1 (002): OpenRouter per-provider endpoints as primary cheapest source."""
+
+    def setUp(self):
+        super().setUp()
+        self.endpoints_dir = os.path.join(self.tmp.name, "cache", "endpoints")
+
+    def _k3_catalog_sidecar(self):
+        self._write_discovery(1, openrouter={"moonshotai/kimi-k3": {"in": 3.0, "out": 15.0, "source": "openrouter"}})
+
+    def _k3_endpoints_doc(self):
+        return json.dumps({"data": {"endpoints": [
+            {"provider_name": "Makora", "tag": "makora", "quantization": "unknown",
+             "pricing": {"prompt": "0.00000255", "completion": "0.00001275", "input_cache_read": "0.0000005"}},
+            {"provider_name": "DeepInfra", "tag": "deepinfra", "quantization": "bf16",
+             "pricing": {"prompt": "0.00000285", "completion": "0.00001425"}},
+        ]}})
+
+    def _run(self, action, model=None, offline=False, or_fetcher=None, ll_fetcher=None):
+        import contextlib, io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = query_main(
+                self._args(action, model, offline),
+                openrouter_fetcher=or_fetcher or self._raising,
+                litellm_fetcher=ll_fetcher or self._raising,
+                now=self.now,
+                cache_path=self.cache_path,
+                overrides_path=self.overrides_path,
+                discovery_path=self.discovery_path,
+                endpoints_dir=self.endpoints_dir,
+            )
+        return code, json.loads(out.getvalue())
+
+    def test_endpoints_primary_with_quantization(self):
+        self._write_cache(1)
+        self._k3_catalog_sidecar()
+        code, data = self._run("cheapest", "kimi-k3", or_fetcher=lambda u: self._k3_endpoints_doc())
+        self.assertEqual(code, 0)
+        self.assertEqual(data["source"], "openrouter-endpoints")
+        self.assertEqual(data["slug"], "moonshotai/kimi-k3")
+        self.assertEqual(data["provider"], "Makora")
+        self.assertEqual(data["in"], 2.55)
+        self.assertEqual(data["quantization"], "unknown")
+        self.assertEqual(data["in_cache_read"], 0.5)
+        self.assertEqual(data["variants"], 2)
+        self.assertTrue(data["baseline"])
+
+    def test_snapshot_cache_hit_zero_network(self):
+        self._write_cache(1)
+        self._k3_catalog_sidecar()
+        path = _endpoint_snapshot_path("moonshotai/kimi-k3", self.endpoints_dir)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        snap = {"fetched_at": self.now.isoformat(), "ttl_hours": 24, "slug": "moonshotai/kimi-k3",
+                "endpoints": [{"provider_name": "Makora", "tag": "makora", "quantization": "unknown",
+                                "in": 2.55, "out": 12.75}]}
+        json.dump(snap, open(path, "w"))
+        code, data = self._run("cheapest", "kimi-k3", offline=False)
+        self.assertEqual(code, 0)
+        self.assertEqual(data["provider"], "Makora")
+
+    def test_stale_snapshot_offline_served_exit1(self):
+        self._write_cache(1)
+        self._k3_catalog_sidecar()
+        path = _endpoint_snapshot_path("moonshotai/kimi-k3", self.endpoints_dir)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        snap = {"fetched_at": (self.now - timedelta(hours=48)).isoformat(), "ttl_hours": 24,
+                "slug": "moonshotai/kimi-k3",
+                "endpoints": [{"provider_name": "Makora", "tag": "makora", "quantization": "unknown",
+                                "in": 2.55, "out": 12.75}]}
+        json.dump(snap, open(path, "w"))
+        code, data = self._run("cheapest", "kimi-k3", offline=True)
+        self.assertEqual(code, 1)
+        self.assertEqual(data["provider"], "Makora")
+        self.assertEqual(data["freshness"], "stale")
+
+    def test_no_slug_falls_back_to_variant_scan(self):
+        self._write_cache(1)
+        self._write_discovery(1, litellm={"zai/glm-5.2": {"in": 0.46, "out": 1.45, "source": "litellm"}},
+                              openrouter={})
+        code, data = self._run("cheapest", "glm-5.2", offline=True)
+        self.assertEqual(code, 0)
+        self.assertTrue(data["fallback"])
+        self.assertEqual(data["source"], "litellm")
+
+    def test_endpoints_fetch_failure_falls_back(self):
+        self._write_cache(1)
+        self._k3_catalog_sidecar()
+        self._write_discovery(1, litellm={"moonshotai/kimi-k3": {"in": 3.0, "out": 15.0, "source": "litellm"}},
+                              openrouter={"moonshotai/kimi-k3": {"in": 3.0, "out": 15.0, "source": "openrouter"}})
+        code, data = self._run("cheapest", "kimi-k3", or_fetcher=self._raising)
+        self.assertEqual(code, 0)
+        self.assertTrue(data["fallback"])
+
+    def test_override_slug_resolution(self):
+        self._write_cache(1)
+        self._write_discovery(1, openrouter={"moonshotai/kimi-k3-special": {"in": 3.0, "out": 15.0, "source": "openrouter"}})
+        with open(self.overrides_path, "w", encoding="utf-8") as fh:
+            json.dump({"kimi-k3": {"openrouter_slug": "moonshotai/kimi-k3-special"}}, fh)
+        code, data = self._run("cheapest", "kimi-k3", or_fetcher=lambda u: self._k3_endpoints_doc())
+        self.assertEqual(code, 0)
+        self.assertEqual(data["slug"], "moonshotai/kimi-k3-special")
+
+
+class TestBaselineCacheFields(unittest.TestCase):
+    """US2 (002): richer OpenRouter baseline fields."""
+
+    def test_cache_fields_captured(self):
+        doc = {"data": [{"id": "openai/gpt-4o",
+                         "pricing": {"prompt": "0.0000025", "completion": "0.00001",
+                                     "input_cache_read": "0.000001", "input_cache_write": "0.000003",
+                                     "overrides": {"some": "policy"}}}]}
+        layer = _normalize_openrouter(doc)
+        entry = layer["openai/gpt-4o"]
+        self.assertEqual(entry["in_cache_read"], 1.0)
+        self.assertEqual(entry["in_cache_write"], 3.0)
+        self.assertTrue(entry["has_pricing_overrides"])
+
+    def test_no_cache_fields_when_absent(self):
+        doc = {"data": [{"id": "openai/gpt-4o",
+                         "pricing": {"prompt": "0.0000025", "completion": "0.00001"}}]}
+        entry = _normalize_openrouter(doc)["openai/gpt-4o"]
+        self.assertNotIn("in_cache_read", entry)
+        self.assertNotIn("has_pricing_overrides", entry)
 
 
 if __name__ == "__main__":

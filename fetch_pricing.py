@@ -26,6 +26,8 @@ INVOCATION_SCRIPT_DIR = _SCRIPT_DIR
 OVERRIDES_PATH = os.path.join(_SCRIPT_DIR, "overrides.json")
 CACHE_PATH = os.path.join(_SCRIPT_DIR, "cache", "pricing.json")
 DISCOVERY_PATH = os.path.join(_SCRIPT_DIR, "cache", "discovery.json")
+ENDPOINTS_CACHE_DIR = os.path.join(_SCRIPT_DIR, "cache", "endpoints")
+OPENROUTER_ENDPOINTS_URL = "https://openrouter.ai/api/v1/models/{slug}/endpoints"
 
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 LITELLM_PRICES_URL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
@@ -103,7 +105,11 @@ def _to_price_per_1m(value):
 
 
 def _normalize_openrouter(data):
-    """Tolerant extraction of OpenRouter catalog entries (layer 3)."""
+    """Tolerant extraction of OpenRouter catalog entries (layer 3).
+
+    Captures plain in/out plus, when present, input-cache read/write pricing
+    and a flag for conditional pricing overrides (additive baseline fields).
+    """
     models = {}
     for item in data.get("data", []) if isinstance(data, dict) else []:
         mid = item.get("id")
@@ -119,6 +125,14 @@ def _normalize_openrouter(data):
             entry["in"] = inp
         if out is not None:
             entry["out"] = out
+        cache_read = _to_price_per_1m(pricing.get("input_cache_read"))
+        if cache_read is not None:
+            entry["in_cache_read"] = cache_read
+        cache_write = _to_price_per_1m(pricing.get("input_cache_write"))
+        if cache_write is not None:
+            entry["in_cache_write"] = cache_write
+        if pricing.get("overrides"):
+            entry["has_pricing_overrides"] = True
         models[mid] = entry
     return models
 
@@ -407,6 +421,104 @@ def ensure_discovery(offline, ttl_hours=DEFAULT_TTL_HOURS, now=None,
     return _load_discovery(path)
 
 
+def _endpoint_snapshot_path(slug, endpoints_dir=ENDPOINTS_CACHE_DIR):
+    """Path for one model's endpoint snapshot (slugs contain '/'; flatten)."""
+    return os.path.join(endpoints_dir, slug.replace("/", "__") + ".json")
+
+
+def _emit_endpoint_snapshot(path, payload):
+    """Write an endpoint snapshot envelope."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, sort_keys=True)
+
+
+def _load_endpoint_snapshot(path):
+    """Load an endpoint snapshot envelope, or None if missing/corrupt/wrong shape."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("endpoints"), list):
+        return None
+    return data
+
+
+def fetch_endpoints(slug, fetcher=_default_fetcher):
+    """Fetch and normalize OpenRouter per-provider endpoints for a slug (FR-001).
+
+    Tolerant extraction: provider name/tag, quantization, context length, and
+    prompt/completion/input-cache-read prices (USD per 1M tokens).
+    """
+    url = OPENROUTER_ENDPOINTS_URL.format(slug=slug)
+    data = json.loads(fetcher(url))
+    eps = data.get("data", {})
+    items = eps.get("endpoints", []) if isinstance(eps, dict) else (eps if isinstance(eps, list) else [])
+    out = []
+    for e in items:
+        if not isinstance(e, dict):
+            continue
+        pricing = e.get("pricing") or {}
+        inp = _to_price_per_1m(pricing.get("prompt"))
+        outp = _to_price_per_1m(pricing.get("completion"))
+        if inp is None and outp is None:
+            continue
+        entry = {"provider_name": e.get("provider_name"), "provider_tag": e.get("tag"),
+                 "quantization": e.get("quantization"), "context_length": e.get("context_length")}
+        if inp is not None:
+            entry["in"] = inp
+        if outp is not None:
+            entry["out"] = outp
+        cache_read = _to_price_per_1m(pricing.get("input_cache_read"))
+        if cache_read is not None:
+            entry["in_cache_read"] = cache_read
+        out.append(entry)
+    return out
+
+
+def _resolve_slug(catalog_ids, model, overrides):
+    """Resolve a model id to an OpenRouter slug (FR-002).
+
+    Order: exact catalog id match, overrides-declared `openrouter_slug`
+    (when present in the catalog), then a catalog last-segment match. Returns
+    None when unresolvable (caller falls back to the variant scan).
+    """
+    if model in catalog_ids:
+        return model
+    entry = (overrides or {}).get(model)
+    if isinstance(entry, dict) and entry.get("openrouter_slug") in catalog_ids:
+        return entry["openrouter_slug"]
+    for mid in catalog_ids:
+        if mid.rsplit("/", 1)[-1] == model:
+            return mid
+    return None
+
+
+def ensure_endpoints(model, slug, offline, ttl_hours=DEFAULT_TTL_HOURS, now=None,
+                     fetcher=_default_fetcher, endpoints_dir=ENDPOINTS_CACHE_DIR):
+    """Serve or fetch the endpoint snapshot for a slug (FR-003, FR-008).
+
+    Returns (snapshot_or_None, freshness). Fresh snapshot -> zero network;
+    stale/missing + online -> fetch and persist; offline or fetch failure ->
+    serve the existing snapshot as-is (possibly None).
+    """
+    path = _endpoint_snapshot_path(slug, endpoints_dir)
+    snap = _load_endpoint_snapshot(path)
+    if snap is not None and is_fresh(snap, ttl_hours, now=now):
+        return snap, "fresh"
+    if offline:
+        return snap, ("stale" if snap is not None else "no-data")
+    try:
+        endpoints = fetch_endpoints(slug, fetcher)
+    except Exception:
+        return snap, ("stale" if snap is not None else "no-data")
+    snap = {"fetched_at": _now_iso(now), "ttl_hours": ttl_hours, "slug": slug,
+            "endpoints": endpoints}
+    _emit_endpoint_snapshot(path, snap)
+    return snap, "fresh"
+
+
 def _normalize_model(name):
     """Normalize a model id for variant matching.
 
@@ -436,7 +548,7 @@ def _exit_for(freshness):
 
 def query_main(args, openrouter_fetcher=_default_fetcher, litellm_fetcher=_default_fetcher,
                now=None, cache_path=CACHE_PATH, overrides_path=OVERRIDES_PATH,
-               discovery_path=DISCOVERY_PATH):
+               discovery_path=DISCOVERY_PATH, endpoints_dir=ENDPOINTS_CACHE_DIR):
     """Run a `query` subcommand. Prints JSON to stdout; returns an exit code.
 
     Exit codes (FR-008): 0 fresh answer, 1 stale answer, 2 no data / not found.
@@ -518,6 +630,30 @@ def query_main(args, openrouter_fetcher=_default_fetcher, litellm_fetcher=_defau
 
     if action == "cheapest":
         authoritative = dict(cache_models[model]) if model in cache_models else None
+        # US1: OpenRouter per-provider endpoints path (primary).
+        catalog_ids = set((disc or {}).get("openrouter", {}).keys())
+        overrides = load_overrides(overrides_path)
+        slug = _resolve_slug(catalog_ids, model, overrides) if catalog_ids else None
+        if slug is not None:
+            snap, ep_freshness = ensure_endpoints(model, slug, offline, ttl_hours, now,
+                                                  fetcher=openrouter_fetcher,
+                                                  endpoints_dir=endpoints_dir)
+            eps = (snap or {}).get("endpoints", [])
+            if eps:
+                cheapest = min(eps, key=lambda e: (e.get("in", float("inf")),
+                                                   e.get("out", float("inf"))))
+                payload = {"model": model, "slug": slug,
+                           "provider": cheapest.get("provider_name"),
+                           "provider_tag": cheapest.get("provider_tag"),
+                           "quantization": cheapest.get("quantization"),
+                           "in": cheapest.get("in"), "out": cheapest.get("out"),
+                           "source": "openrouter-endpoints", "baseline": True,
+                           "authoritative": authoritative, "variants": len(eps),
+                           "freshness": ep_freshness}
+                if "in_cache_read" in cheapest:
+                    payload["in_cache_read"] = cheapest["in_cache_read"]
+                return _out(payload, ep_freshness)
+        # Fallback: LiteLLM/OpenRouter variant scan for vendor-direct models (FR-004).
         variants = []
         if disc is not None:
             for layer_name in ("litellm", "openrouter"):
@@ -530,8 +666,8 @@ def query_main(args, openrouter_fetcher=_default_fetcher, litellm_fetcher=_defau
         cheapest = min(variants, key=lambda v: (v["in"], v["out"]))
         return _out({"model": model, "provider": cheapest["provider"], "in": cheapest["in"],
                      "out": cheapest["out"], "source": cheapest["source"], "baseline": True,
-                     "authoritative": authoritative, "variants": len(variants),
-                     "freshness": disc_freshness}, disc_freshness)
+                     "fallback": True, "authoritative": authoritative,
+                     "variants": len(variants), "freshness": disc_freshness}, disc_freshness)
 
     print(json.dumps({"error": "unknown action %r" % action}), file=sys.stderr)
     return 2

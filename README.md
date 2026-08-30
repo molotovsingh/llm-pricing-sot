@@ -25,19 +25,21 @@ Optional later upgrade: a keep-warm cron that calls the *same script* daily (pre
 
 ## Sources — three layers, merge precedence top-down
 
-| Layer | Source | Role | Verified (2026-08-29) |
+| Layer | Source | Role | Verified (2026-08-30) |
 | :-- | :-- | :-- | :-- |
-| 1. **Overrides** (truth) | Local `overrides.json` | What we actually pay: z.ai GLM direct, vendor list rates, negotiated prices, tokenizer mappings | Existing `llm-cost-estimator/data/pricing.json` becomes this |
-| 2. **Multi-provider** (discovery) | LiteLLM `model_prices_and_context_window.json` (GitHub raw) | Cheapest host for open-weight models (K3 via moonshot/databricks, GLM via dashscope/cloudflare) | ✅ 3,365 entries, includes kimi-k3, glm-5.2, claude-opus-5, gpt-5.6 |
-| 3. **Catalog baseline** (discovery) | OpenRouter `GET https://openrouter.ai/api/v1/models` | Canonical per-model price incl. cache-read/write; covers closed + open in one public no-auth call | ✅ 396 models, all with pricing blocks |
+| 1. **Overrides** (truth) | Local `overrides.json` | What we actually pay: z.ai GLM direct, vendor list rates, negotiated prices, tokenizer mappings, optional `openrouter_slug` mappings | Existing `llm-cost-estimator/data/pricing.json` becomes this |
+| 2. **Cheapest host** (baseline) | OpenRouter `GET /api/v1/models/{author}/{slug}/endpoints` (public, no auth) | Per-provider endpoint pricing: provider name, quantization, cache-read price. Primary source for `query cheapest` on OpenRouter-routed models | ✅ 17 endpoints for `moonshotai/kimi-k3` (Makora, DeepInfra, Morph, ...) |
+| 3. **Catalog baseline** (discovery) | OpenRouter `GET /api/v1/models` | Canonical per-model price incl. cache-read/write + conditional pricing flag; slug resolution for the endpoints API | ✅ 396 models, all with pricing blocks |
+| 4. **Fallback / cross-check** | LiteLLM `model_prices_and_context_window.json` (GitHub raw) | Vendor-direct pricing OpenRouter does not list (z.ai GLM official rates); demoted fallback for `query cheapest` | ✅ 3,365 entries |
 
 **Hugging Face is NOT in the automated path.** Empirically tested: hub API (`/api/models/{id}`) carries no pricing, router API is auth-walled, model-card frontmatter has no `inference_providers` block (checked Kimi-K3, DeepSeek-V3, Qwen3.5). HF's provider-price tables on the website come from an internal endpoint with no public contract. HF = manual reference only.
 
 ### Caveats
 
 - OpenRouter price ≠ what we pay unless we route via OpenRouter. It is baseline, not truth.
-- LiteLLM DB is community-maintained — expect occasional stale rows. Overrides guard every number that reaches the estimator.
+- LiteLLM DB is community-maintained — expect occasional stale rows. It is a fallback/cross-check, never the primary cheapest source. Overrides guard every number that reaches the estimator.
 - OpenRouter/LiteLLM give prices, not tokenizer specs. Tokenizer/fallback mapping stays in the overrides layer.
+- The OpenRouter MCP server is for **interactive** agent-time lookups only (credits, exact per-generation cost, provider latency); the unattended fetcher uses plain REST. OAuth + 7-day key expiry + spend cap make MCP unsuitable for the pipeline.
 
 ## Consumers
 

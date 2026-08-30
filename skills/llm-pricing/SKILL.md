@@ -42,3 +42,10 @@ python ~/llm/llm-pricing-sot/fetch_pricing.py --force    # force a full refresh
 ```bash
 ~/llm/llm-cost-estimator/estimate_llm_cost.py --pricing-dir ~/llm/llm-pricing-sot <file> [--max-tokens N] [--models m1,m2]
 ```
+
+## OpenRouter account lookups (interactive only)
+
+For interactive OpenRouter account state — credits balance, exact cost of a specific
+`generation` id, provider latency/data-policy for a model — use OpenRouter's official
+MCP server. Do NOT use it for the unattended pricing fetcher: it needs OAuth consent,
+a 7-day expiring key, and a spend cap; the local pipeline uses plain REST instead.
