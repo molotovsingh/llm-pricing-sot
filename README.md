@@ -51,7 +51,7 @@ Optional later upgrade: a keep-warm cron that calls the *same script* daily (pre
 
 Every consumer reads the **same file**: `<repo>/cache/pricing.json` (repo-local).
 
-**Schema you read:** `{ "fetched_at": "<ISO-8601 UTC>", "ttl_hours": 24, "freshness": "fresh", "models": { "<model_id>": { "in": <$/1M>, "out": <$/1M>, "tokenizer": "...", "fallback": "...", "source": "override" } } }`. Prices are USD per 1M tokens.
+**Schema you read:** `{ "fetched_at": "<ISO-8601 UTC>", "ttl_hours": 24, "freshness": "fresh", "models": { "<model_id>": { "in": <$/1M>, "out": <$/1M>, "tokenizer": "...", "fallback" (optional), "source": "override" } } }`. Prices are USD per 1M tokens.
 
 **Judge staleness** from `freshness` (`fresh` / `stale`), or recompute from `fetched_at` + `ttl_hours`. A cache is stale when `now - fetched_at >= ttl_hours`; missing/unparseable `fetched_at` is treated as stale.
 
@@ -67,13 +67,27 @@ Every consumer reads the **same file**: `<repo>/cache/pricing.json` (repo-local)
 llm-pricing-sot/
 ├── README.md                 # this file
 ├── overrides.json            # layer 1 — hand-maintained, highest precedence
+├── fetch_pricing.py          # stdlib-only pipeline: fetch → merge → emit (T-001..T-008 done)
 ├── cache/
-│   └── pricing.json          # merged output: {fetched_at, ttl_hours, models: {...}}
-├── fetch_pricing.py          # TBD — fetch → merge → emit (not built yet)
-└── tests/                    # TBD
+│   ├── pricing.json          # merged output: {fetched_at, freshness, ttl_hours, models: {...}}
+│   ├── discovery.json        # raw layers: {fetched_at, ttl_hours, litellm, openrouter}
+│   └── endpoints/            # per-slug endpoint snapshots for `query cheapest`
+├── tests/                    # 58 tests: merge precedence, TTL, stale-fallback, queries
+├── specs/                    # SDD spec for the pipeline (T-001..T-008)
+└── .specify/                 # spec-kit workspace
 ```
 
-Merged model entry shape (planned, matches llm-cost-estimator's expectations):
+**CLI surface (implemented):**
+
+```
+fetch_pricing.py [--force] [--ttl-hours H]      # refresh if stale, emit cache; exit 0 fresh / 1 stale-served / 2 no cache
+fetch_pricing.py query price <model>            # authoritative price (override if present)
+fetch_pricing.py query cheapest <model>         # cheapest OpenRouter endpoint + authoritative override
+fetch_pricing.py query list                    # all models in cache
+fetch_pricing.py query fresh                   # freshness metadata
+```
+
+Merged model entry shape (as emitted — matches llm-cost-estimator's expectations; `fallback` only present for HF-tokenizer models):
 
 ```json
 {
@@ -81,21 +95,21 @@ Merged model entry shape (planned, matches llm-cost-estimator's expectations):
     "in": 3.00, "out": 15.00,
     "tokenizer": "hf:moonshotai/Kimi-K3",
     "fallback": "tiktoken:o200k_base",
-    "source": "override",
-    "alternatives": [{"provider": "databricks", "in": 0.80, "out": 3.20}]
+    "source": "override"
   }
 }
 ```
 
-## Build order (when this repo graduates from design to code)
+Per-provider alternatives are **not** inlined into cache entries — they live in `cache/endpoints/<slug>.json` and are surfaced by `query cheapest`, which returns the authoritative override alongside the cheapest endpoint (provider, price, quantization, variant count).
 
-1. `fetch_pricing.py` — two GETs (OpenRouter models API, LiteLLM raw JSON), merge with precedence overrides > LiteLLM > OpenRouter, emit cache + freshness metadata, staleness flag on failure.
-2. `overrides.json` — seed from `~/llm/llm-cost-estimator/data/pricing.json`.
-3. Tests — merge precedence, TTL logic, stale-fallback path, schema validation (mirror llm-cost-estimator's pricing validation).
-4. Wire consumers — point llm-cost-estimator at the merged cache; document the read path for Hermes/Pi agents.
+## Build status — DONE
+
+- ✅ `fetch_pricing.py` — fetch (OpenRouter models + `/endpoints`, LiteLLM), merge (overrides > endpoints > models > LiteLLM), emit cache with freshness metadata, stale-fallback on failure
+- ✅ `overrides.json` — seeded from `~/llm/llm-cost-estimator/data/pricing.json`
+- ✅ Tests — 58 passing: merge precedence, TTL logic, stale-fallback, query surface
+- ✅ Cache — `cache/pricing.json` + `discovery.json` + `endpoints/` emitting per the contract
+- 🔜 Consumer wiring — llm-cost-estimator integration via `LLM_PRICING_SOT_DIR` / `--pricing-dir` documented but not yet shipped in the estimator
 
 ## Open questions
 
-- TTL default: 24h proposed. Cost-critical runs (e.g. The Brief) may want a shorter floor.
-- LiteLLM pull cadence inside the TTL gate: same TTL or independent?
-- Cache location: this repo's `cache/` vs `~/.hermes/data/` shared path. Decision needed before wiring consumers.
+- TTL floor for cost-critical runs (e.g. The Brief) — 24h default; a shorter floor per-run via `--ttl-hours` exists but isn't wired into any consumer yet.
