@@ -179,7 +179,7 @@ Per-provider alternatives are **not** inlined into cache entries — they live i
 
 ## Build status — DONE
 
-- ✅ `fetch_pricing.py` — fetch (OpenRouter models + `/endpoints`, LiteLLM), merge (overrides > endpoints > models > LiteLLM), emit cache with freshness metadata, stale-fallback on failure
+- ✅ `fetch_pricing.py` — fetch (OpenRouter models + `/endpoints`, LiteLLM), merge (attested overrides > OpenRouter catalog > LiteLLM), emit cache with freshness + review metadata, stale-fallback when the catalog is unreachable
 - ✅ `overrides.json` — seeded from `~/llm/llm-cost-estimator/data/pricing.json`; carries optional `openrouter_slug` where the short alias can't be resolved from the catalog
 - ✅ Attested-price enforcement — unattested hand-typed prices are discarded for the live catalog price; attestations expire after 90 days; anything reviewable degrades the exit code
 - ✅ Tests — 99 passing: merge precedence, TTL logic, stale-fallback, query surface, catalog linkage, attestation + review, atomic writes, cheapest ranking
