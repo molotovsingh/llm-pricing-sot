@@ -13,8 +13,6 @@ import json
 import os
 import re
 import sys
-import tempfile
-import urllib.request
 from datetime import datetime, timezone
 
 DEFAULT_TTL_HOURS = 24
@@ -105,6 +103,7 @@ def load_overrides(path=OVERRIDES_PATH):
 
 def _default_fetcher(url):
     """Default HTTP GET via stdlib urllib. Returns decoded text (NFR-001)."""
+    import urllib.request  # deferred: 14ms import tree, unused on offline read path
     with urllib.request.urlopen(url, timeout=30) as resp:
         return resp.read().decode("utf-8")
 
@@ -422,6 +421,7 @@ def _write_json_atomic(path, payload, **dump_kwargs):
     truncate-and-write lets a reader observe a half-written file. os.replace is
     atomic within a filesystem, so a reader sees either the old or the new file.
     """
+    import tempfile  # deferred: 6.3ms import tree, only needed when writing
     directory = os.path.dirname(os.path.abspath(path))
     os.makedirs(directory, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-", suffix=".json")
