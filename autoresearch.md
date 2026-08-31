@@ -76,3 +76,18 @@ Discovery (2026-09, pre-session):
   argparse 0.54ms) — immaterial, not a target.
 - Rejected: test-suite speed (no leverage, no CI); refresh/network path
   (network-judged, verifiability 0).
+
+Session results (2026-09):
+
+- **KEEP #2** — deferred `urllib.request` → `_default_fetcher`, `tempfile` →
+  `_write_json_atomic` (2 line-moves + 2 comments): 46.45 → 34.09ms
+  (−12.36ms, −26.6%), win 6.2× in-session spread. Checks green, pins held.
+  Learning: /tmp prototype promised 31.8ms; worktree location costs ~2ms
+  vs /tmp — cross-location cold-start comparisons are approximate; the
+  in-session ruler is authoritative.
+- **STOP (honest)** — target 32 was derived from the /tmp prototype; the
+  worktree ruler says 34.09. Remaining decomposition: 14.6 floor + ~2.7
+  imports (all used by the query path) + ~1.9 logic. No mechanism ≥2× the
+  2–4ms noise floor remains. Further experiments would be noise-mining.
+- Exit-code discovery: `query list`/`fresh` legitimately exit 1 (degraded —
+  4 models in the review queue, per FR-008). Not a failure; checks accept it.
