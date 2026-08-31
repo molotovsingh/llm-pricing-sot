@@ -21,12 +21,29 @@ python ~/llm/llm-pricing-sot/fetch_pricing.py --force
 ```
 
 Interpretation:
-- `"baseline": false` → a model the SOT tracks. Use this price. `source` says where
-  it came from: `override` = an attested rate we pay; `openrouter`/`litellm` = the
-  live catalog price, refreshed automatically. Most tracked models read
-  `openrouter` by design — hand-typed prices are avoided because they rot.
-- `"baseline": true` → discovery pricing (OpenRouter/LiteLLM) — not a tracked
-  model; informational only.
-- `"degraded": true` → the answer is usable but stale or in `needs_review`.
-- Exit codes: `0` clean, `1` served but degraded, `2` no data. Canonical statement:
-  `.specify/memory/constitution.md` Principle III.
+
+<!-- contract:begin trust-rule -->
+- `baseline: false` → the model is tracked by the SOT; use this price.
+- `source` explains provenance only — `override` is an attested rate,
+  `openrouter`/`litellm` is the live catalog price. **`source` does not gate trust.**
+- `baseline: true` → discovery data, not a tracked model; informational only.
+- `degraded: true` → usable but stale or in `needs_review`.
+<!-- contract:end trust-rule -->
+
+Most tracked models read `openrouter` by design — hand-typed prices are avoided
+because they rot.
+
+Exit codes:
+
+<!-- contract:begin exit-codes -->
+| freshness | degraded | exit |
+|---|---|---|
+| `fresh` | no | `0` |
+| `fresh` | yes | `1` |
+| `stale` | no | `1` |
+| `stale` | yes | `1` |
+| `no-data` | no | `2` |
+| `no-data` | yes | `2` |
+
+`0` clean · `1` served but degraded (stale **or** the answer's entry is in `needs_review`) · `2` no usable data.
+<!-- contract:end exit-codes -->

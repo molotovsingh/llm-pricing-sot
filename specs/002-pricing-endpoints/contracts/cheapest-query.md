@@ -3,10 +3,21 @@
 Surface: `python fetch_pricing.py query cheapest <model> [--offline]`
 (existing surface; answer shape extended).
 
-Rules unchanged: one JSON object to stdout; notes to stderr. Exit codes follow the
-canonical statement in `.specify/memory/constitution.md` (Principle III):
-`0` clean / `1` served but degraded (stale, or the authoritative entry is in
-`needs_review`) / `2` no data.
+Rules unchanged: one JSON object to stdout; notes to stderr. For `cheapest`, the
+degraded condition is that the *authoritative* entry is in `needs_review`.
+
+<!-- contract:begin exit-codes -->
+| freshness | degraded | exit |
+|---|---|---|
+| `fresh` | no | `0` |
+| `fresh` | yes | `1` |
+| `stale` | no | `1` |
+| `stale` | yes | `1` |
+| `no-data` | no | `2` |
+| `no-data` | yes | `2` |
+
+`0` clean · `1` served but degraded (stale **or** the answer's entry is in `needs_review`) · `2` no usable data.
+<!-- contract:end exit-codes -->
 
 ## Answer shape — endpoints path (OpenRouter-routed models)
 

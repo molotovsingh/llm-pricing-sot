@@ -53,11 +53,40 @@ Every consumer reads the **same file**: `<repo>/cache/pricing.json` (repo-local)
 
 **Schema you read:** `{ "fetched_at": "<ISO-8601 UTC>", "ttl_hours": 24, "freshness": "fresh", "needs_review": ["<model_id>", ...], "models": { "<model_id>": { "in": <$/1M>, "out": <$/1M>, "tokenizer": "...", "fallback" (optional), "source": "override"|"openrouter"|"litellm", "catalog" (optional), "drift" (optional), "review" (optional) } } }`. Prices are USD per 1M tokens.
 
+The envelope keys are fixed:
+
+<!-- contract:begin envelope -->
+Cache envelope keys: `fetched_at`, `freshness`, `models`, `needs_review`, `ttl_hours`.
+<!-- contract:end envelope -->
+
 **`freshness` is about age, not correctness.** It reports when the data was last fetched, not whether a price is right. That is what `needs_review` is for. Check both.
+
+**Deciding whether to use a price:**
+
+<!-- contract:begin trust-rule -->
+- `baseline: false` → the model is tracked by the SOT; use this price.
+- `source` explains provenance only — `override` is an attested rate,
+  `openrouter`/`litellm` is the live catalog price. **`source` does not gate trust.**
+- `baseline: true` → discovery data, not a tracked model; informational only.
+- `degraded: true` → usable but stale or in `needs_review`.
+<!-- contract:end trust-rule -->
 
 **Judge staleness** from `freshness` (`fresh` / `stale`), or recompute from `fetched_at` + `ttl_hours`. A cache is stale when `now - fetched_at >= ttl_hours`; missing/unparseable `fetched_at` is treated as stale.
 
-**Auto-refresh rule:** if the cache is missing or stale, run `python fetch_pricing.py [--force] [--ttl-hours H]` then re-read. Exit codes: `0` = fresh, nothing to review (proceed), `1` = **served but degraded** — a stale cache, or a non-empty `needs_review` (warn but proceed), `2` = no usable cache (treat as a failure).
+**Auto-refresh rule:** if the cache is missing or stale, run `python fetch_pricing.py [--force] [--ttl-hours H]` then re-read.
+
+<!-- contract:begin exit-codes -->
+| freshness | degraded | exit |
+|---|---|---|
+| `fresh` | no | `0` |
+| `fresh` | yes | `1` |
+| `stale` | no | `1` |
+| `stale` | yes | `1` |
+| `no-data` | no | `2` |
+| `no-data` | yes | `2` |
+
+`0` clean · `1` served but degraded (stale **or** the answer's entry is in `needs_review`) · `2` no usable data.
+<!-- contract:end exit-codes -->
 
 - **Hermes agents** — read the cache file; if `freshness: stale`, run the script (auto-refresh) then re-read. Do not necessarily re-fetch every turn.
 - **Pi** — same file via its bash/read tools; same staleness rule. No Pi-specific integration needed.

@@ -37,17 +37,18 @@ Prices are USD per 1M tokens. One JSON object on stdout; human notes on stderr.
 
 **Is this a price I can use?** Read `baseline`, not `source`:
 
-- **`"baseline": false`** — the model is tracked by the SOT. Use this price.
-  - `"source": "override"` — an *attested* rate we actually pay, deliberately
-    different from public pricing (a `note` says why). `drift` reports the gap.
-  - `"source": "openrouter"` / `"litellm"` — the live catalog price, refreshed
-    automatically. Equally usable; it just isn't a negotiated rate.
-- **`"baseline": true`** — not a tracked model; the answer came from raw discovery
-  data. Informational only. Do not treat it as what we pay.
+<!-- contract:begin trust-rule -->
+- `baseline: false` → the model is tracked by the SOT; use this price.
+- `source` explains provenance only — `override` is an attested rate,
+  `openrouter`/`litellm` is the live catalog price. **`source` does not gate trust.**
+- `baseline: true` → discovery data, not a tracked model; informational only.
+- `degraded: true` → usable but stale or in `needs_review`.
+<!-- contract:end trust-rule -->
 
-Most tracked models read `source: openrouter` by design — hand-typed prices are
-avoided because they rot. A `source` other than `override` does **not** mean the
-answer is unreliable.
+An `override` is deliberately different from public pricing (a `note` says why) and
+`drift` reports the gap. Most tracked models read `source: openrouter` by design —
+hand-typed prices are avoided because they rot. A `source` other than `override`
+does **not** mean the answer is unreliable.
 
 **Fields you may see:** `catalog` (the market row the price was checked against),
 `drift` (normalized gap from it), `review` (a human must look at this entry),
@@ -55,13 +56,22 @@ answer is unreliable.
 
 ## Exit codes
 
-- `0` — clean, proceed.
-- `1` — **served but degraded**: a stale cache *or* a non-empty review queue.
-  The answer is usable; say it is degraded rather than presenting it as certain.
-  Run `query review` to see which entries and why.
-- `2` — no usable data / model not found. Treat as failure.
+<!-- contract:begin exit-codes -->
+| freshness | degraded | exit |
+|---|---|---|
+| `fresh` | no | `0` |
+| `fresh` | yes | `1` |
+| `stale` | no | `1` |
+| `stale` | yes | `1` |
+| `no-data` | no | `2` |
+| `no-data` | yes | `2` |
 
-Exit 1 is not only staleness. Do not report it as "stale data" without checking.
+`0` clean · `1` served but degraded (stale **or** the answer's entry is in `needs_review`) · `2` no usable data.
+<!-- contract:end exit-codes -->
+
+Exit 1 is not only staleness — do not report it as "stale data" without checking.
+The answer is usable; say it is degraded rather than presenting it as certain. Run
+`query review` to see which entries need attention and why.
 
 ## Cost estimate for a call
 

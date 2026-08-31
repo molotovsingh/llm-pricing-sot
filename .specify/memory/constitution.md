@@ -58,12 +58,26 @@ priced by neither route MUST be reported, never silently dropped.
 
 Consumers interact via a JSON file (`cache/pricing.json`) and the
 `fetch_pricing.py` CLI. Machine output goes to stdout (JSON), human notes to
-stderr. Exit codes MUST be deterministic: `0` clean, `1` served but degraded,
-`2` no usable data. Degraded covers a stale cache *and* entries the pipeline
-could not verify — a consumer MUST NOT be able to use an unverified price while
-seeing a success code. Degradation MUST be reported on the cache-hit path too,
-or it goes silent for the length of the TTL window. No HTTP API, daemon, MCP
-server, or long-running process is permitted.
+stderr. Exit codes MUST be deterministic:
+
+<!-- contract:begin exit-codes -->
+| freshness | degraded | exit |
+|---|---|---|
+| `fresh` | no | `0` |
+| `fresh` | yes | `1` |
+| `stale` | no | `1` |
+| `stale` | yes | `1` |
+| `no-data` | no | `2` |
+| `no-data` | yes | `2` |
+
+`0` clean · `1` served but degraded (stale **or** the answer's entry is in `needs_review`) · `2` no usable data.
+<!-- contract:end exit-codes -->
+
+Degraded covers a stale cache *and* entries the pipeline could not verify — a
+consumer MUST NOT be able to use an unverified price while seeing a success code.
+Degradation MUST be reported on the cache-hit path too, or it goes silent for the
+length of the TTL window. No HTTP API, daemon, MCP server, or long-running
+process is permitted.
 
 ### IV. On-Demand with TTL-Gated Cache
 
@@ -83,8 +97,13 @@ and merge precedence deterministically.
 
 ## Data & Schema Constraints
 
-The cache envelope MUST be `{fetched_at, ttl_hours, freshness, needs_review,
-models}` with `fetched_at` in ISO-8601 UTC. `freshness` reports age only and
+The cache envelope MUST carry exactly these keys:
+
+<!-- contract:begin envelope -->
+Cache envelope keys: `fetched_at`, `freshness`, `models`, `needs_review`, `ttl_hours`.
+<!-- contract:end envelope -->
+
+`fetched_at` is ISO-8601 UTC. `freshness` reports age only and
 MUST NOT be read as a correctness signal; `needs_review` carries the ids a human
 must look at. Prices MUST be USD per 1M tokens. Cache writes MUST be atomic
 (temp file + rename), since multiple agents read these files concurrently.

@@ -4,9 +4,21 @@ Surface: `python fetch_pricing.py [--ttl-hours H] query <action> [model] [--offl
 
 Rules: one JSON object to stdout per invocation; human notes/errors to stderr.
 
-**Exit codes** — canonical statement lives in `.specify/memory/constitution.md`
-(Principle III); restated here for convenience, keep in step with it:
-`0` clean · `1` served but degraded · `2` no data (includes "not found").
+**Exit codes** — derived from the code and kept in step automatically
+(`specs/003-contract-single-source/`). "No data" includes "not found".
+
+<!-- contract:begin exit-codes -->
+| freshness | degraded | exit |
+|---|---|---|
+| `fresh` | no | `0` |
+| `fresh` | yes | `1` |
+| `stale` | no | `1` |
+| `stale` | yes | `1` |
+| `no-data` | no | `2` |
+| `no-data` | yes | `2` |
+
+`0` clean · `1` served but degraded (stale **or** the answer's entry is in `needs_review`) · `2` no usable data.
+<!-- contract:end exit-codes -->
 
 Degraded is **age or trust**, and the two are independent: a stale cache, *or* an
 answer whose entry is in `needs_review`. Every answer carries a `degraded` boolean
