@@ -28,6 +28,11 @@ DRIFT_TOLERANCE = 0.05
 # permanent mute button and hand-typed prices rot exactly as before.
 ATTESTATION_MAX_AGE_DAYS = 90
 
+# Assumed input:output token mix when ranking providers for `query cheapest`.
+# Which host is cheapest depends on the workload's mix, so any single number is
+# an assumption -- it is named in the answer (`ranked_by`) rather than hidden.
+CHEAPEST_IO_RATIO = 3
+
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 INVOCATION_SCRIPT_DIR = _SCRIPT_DIR
 
@@ -515,6 +520,11 @@ def run(ttl_hours=DEFAULT_TTL_HOURS, force=False,
         valid = filter_valid(merged)
         if valid:
             flagged = {mid: e["review"] for mid, e in valid.items() if e.get("review")}
+            # An override that survives with neither its own price nor an inherited
+            # one is absent from the emitted cache. Inheritance is the default and
+            # catalog slugs get renamed, so this must not vanish silently.
+            for mid in set(overrides) - set(valid):
+                flagged[mid] = "dropped-unpriceable"
             payload = build_cache(valid, ttl_hours, _now_iso(now), "fresh", flagged)
             emit(payload, cache_path)
             if discovery_path:
@@ -696,6 +706,18 @@ def ensure_endpoints(model, slug, offline, ttl_hours=DEFAULT_TTL_HOURS, now=None
     return snap, "fresh"
 
 
+def _blended_cost(entry, ratio=CHEAPEST_IO_RATIO):
+    """Cost of one blended token at `ratio` input tokens per output token.
+
+    Ranking on input price alone lets a host with cheap input and expensive
+    output win, which is the wrong answer for any real workload.
+    """
+    price_in, price_out = entry.get("in"), entry.get("out")
+    if price_in is None or price_out is None:
+        return float("inf")
+    return (ratio * price_in + price_out) / (ratio + 1)
+
+
 def _normalize_model(name):
     """Normalize a model id for variant matching.
 
@@ -817,9 +839,9 @@ def query_main(args, openrouter_fetcher=_default_fetcher, litellm_fetcher=_defau
                                                   endpoints_dir=endpoints_dir)
             eps = (snap or {}).get("endpoints", [])
             if eps:
-                cheapest = min(eps, key=lambda e: (e.get("in", float("inf")),
-                                                   e.get("out", float("inf"))))
+                cheapest = min(eps, key=_blended_cost)
                 payload = {"model": model, "slug": slug,
+                           "ranked_by": f"blended-{CHEAPEST_IO_RATIO}:1",
                            "provider": cheapest.get("provider_name"),
                            "provider_tag": cheapest.get("provider_tag"),
                            "quantization": cheapest.get("quantization"),
@@ -840,10 +862,11 @@ def query_main(args, openrouter_fetcher=_default_fetcher, litellm_fetcher=_defau
                                          "source": layer_name})
         if not variants:
             return _out({"model": model, "found": False, "freshness": freshness}, "no-data")
-        cheapest = min(variants, key=lambda v: (v["in"], v["out"]))
+        cheapest = min(variants, key=_blended_cost)
         return _out({"model": model, "provider": cheapest["provider"], "in": cheapest["in"],
                      "out": cheapest["out"], "source": cheapest["source"], "baseline": True,
                      "fallback": True, "authoritative": authoritative,
+                     "ranked_by": f"blended-{CHEAPEST_IO_RATIO}:1",
                      "variants": len(variants), "freshness": disc_freshness}, disc_freshness)
 
     print(json.dumps({"error": "unknown action %r" % action}), file=sys.stderr)

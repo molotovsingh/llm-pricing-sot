@@ -33,6 +33,7 @@ from fetch_pricing import (
     query_main,
     run,
     validate_entry,
+    _blended_cost,
     _endpoint_snapshot_path,
     _normalize_model,
     _normalize_openrouter,
@@ -1030,3 +1031,49 @@ class TestCliWiring(unittest.TestCase):
 
             self.assertEqual(freshness_with(24), "fresh")
             self.assertEqual(freshness_with(1), "stale")
+
+
+class TestUnpriceableOverride(unittest.TestCase):
+    """Inheritance is the default, and catalog slugs get renamed."""
+
+    def test_override_that_cannot_be_priced_is_reported_not_dropped_silently(self):
+        with tempfile.TemporaryDirectory() as d:
+            cache_path = os.path.join(d, "pricing.json")
+            overrides_path = os.path.join(d, "overrides.json")
+            with open(overrides_path, "w", encoding="utf-8") as fh:
+                json.dump({"good": {"tokenizer": "tok", "openrouter_slug": "x/good"},
+                           "renamed": {"tokenizer": "tok", "openrouter_slug": "x/gone"}}, fh)
+            catalog = json.dumps({"data": [{"id": "x/good",
+                                            "pricing": {"prompt": "0.000003",
+                                                        "completion": "0.000015"}}]})
+            code = run(cache_path=cache_path, overrides_path=overrides_path,
+                       openrouter_fetcher=lambda u: catalog,
+                       litellm_fetcher=lambda u: json.dumps({}))
+            self.assertEqual(code, 1)
+            with open(cache_path, "r", encoding="utf-8") as fh:
+                cache = json.load(fh)
+            self.assertNotIn("renamed", cache["models"])
+            self.assertIn("renamed", cache["needs_review"])
+
+
+class TestCheapestRanking(unittest.TestCase):
+    """Cheapest must weigh output price, not use it only to break input ties."""
+
+    def test_cheap_input_expensive_output_does_not_win(self):
+        trap = {"provider_name": "trap", "in": 0.1, "out": 100.0}
+        sane = {"provider_name": "sane", "in": 0.2, "out": 1.0}
+        self.assertEqual(min([trap, sane], key=_blended_cost)["provider_name"], "sane")
+
+    def test_ranks_on_the_documented_blend(self):
+        # 3:1 -> (3*in + out) / 4
+        self.assertAlmostEqual(_blended_cost({"in": 2.0, "out": 10.0}), 4.0)
+
+    def test_missing_price_never_wins(self):
+        partial = {"provider_name": "partial", "in": 0.01}
+        full = {"provider_name": "full", "in": 5.0, "out": 5.0}
+        self.assertEqual(min([partial, full], key=_blended_cost)["provider_name"], "full")
+
+    def test_ties_are_resolved_deterministically(self):
+        a = {"provider_name": "a", "in": 1.0, "out": 2.0}
+        b = {"provider_name": "b", "in": 1.0, "out": 2.0}
+        self.assertEqual(min([a, b], key=_blended_cost)["provider_name"], "a")

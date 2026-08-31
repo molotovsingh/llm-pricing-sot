@@ -92,6 +92,13 @@ fetch_pricing.py query fresh                   # freshness metadata
 `--ttl-hours` applies to queries too (`fetch_pricing.py --ttl-hours 1 query price <model>`),
 so a cost-critical run can demand a tighter freshness window than the 24h default.
 
+**How `cheapest` ranks.** Which host is cheapest depends on your input:output token mix, so
+providers are ranked on blended cost at `CHEAPEST_IO_RATIO` (3 input : 1 output) rather
+than on input price alone — otherwise a host with cheap input and expensive output wins a
+comparison it should lose. The assumption is named in the answer as `ranked_by`, and an
+endpoint missing either price never wins. Ties resolve to the first provider in catalog
+order, as the spec requires.
+
 Merged model entry shape (as emitted — matches llm-cost-estimator's expectations; `fallback` only present for HF-tokenizer models):
 
 ```json
@@ -149,12 +156,22 @@ asks a human to re-confirm instead.
 
 ### The review queue
 
-`review` reasons: `unattested-price-ignored` (price discarded for the catalog),
-`attestation-expired` (price kept, needs re-confirming), `unverifiable-price` (no catalog
-row to check against). Flagged ids roll up top-level as `needs_review`, print to stderr,
-and **degrade the exit code to 1** — on the cache-hit path too, so a flag cannot go quiet
-for the length of the TTL window. Clear one by attesting the price or deleting `in`/`out`
-so the entry inherits.
+`review` reasons:
+
+| reason | meaning |
+| :-- | :-- |
+| `unattested-price-ignored` | hand-typed price discarded; catalog price used |
+| `attestation-expired` | price kept, `verified_at` needs re-confirming |
+| `unverifiable-price` | price kept; no catalog row to check it against |
+| `dropped-unpriceable` | **absent from `models`** — no own price and no catalog match |
+
+`dropped-unpriceable` is the one that costs you a model rather than a number: it means a
+price-less override's slug no longer resolves (OpenRouter renames and retires slugs), so
+nothing could be inherited. Fix the `openrouter_slug`, or give the entry an attested price.
+
+Flagged ids roll up top-level as `needs_review`, print to stderr, and **degrade the exit
+code to 1** — on the cache-hit path too, so a flag cannot go quiet for the length of the
+TTL window. Clear one by attesting the price or deleting `in`/`out` so the entry inherits.
 
 All of these fields are additive: consumers that ignore them are unaffected.
 
@@ -165,7 +182,7 @@ Per-provider alternatives are **not** inlined into cache entries — they live i
 - ✅ `fetch_pricing.py` — fetch (OpenRouter models + `/endpoints`, LiteLLM), merge (overrides > endpoints > models > LiteLLM), emit cache with freshness metadata, stale-fallback on failure
 - ✅ `overrides.json` — seeded from `~/llm/llm-cost-estimator/data/pricing.json`; carries optional `openrouter_slug` where the short alias can't be resolved from the catalog
 - ✅ Attested-price enforcement — unattested hand-typed prices are discarded for the live catalog price; attestations expire after 90 days; anything reviewable degrades the exit code
-- ✅ Tests — 87 passing: merge precedence, TTL logic, stale-fallback, query surface, catalog linkage, attestation + review
+- ✅ Tests — 99 passing: merge precedence, TTL logic, stale-fallback, query surface, catalog linkage, attestation + review, atomic writes, cheapest ranking
 - ✅ Cache — `cache/pricing.json` + `discovery.json` + `endpoints/` emitting per the contract
 - 🔜 Consumer wiring — llm-cost-estimator integration via `LLM_PRICING_SOT_DIR` / `--pricing-dir` documented but not yet shipped in the estimator
 
