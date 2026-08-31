@@ -32,9 +32,9 @@
 *GATE: Must pass before Phase 0 research. Re-check after Phase 1 design.*
 
 - [ ] Stdlib-only: no third-party deps in the pipeline (Python 3.9+; urllib/json/argparse/unittest)
-- [ ] File + CLI contract: no server/daemon/MCP; JSON to stdout, errors to stderr; exit codes 0/1/2 preserved
-- [ ] SOT precedence honored: overrides > LiteLLM > OpenRouter; no guessed tokenizers; discovery data labeled `baseline: true`
-- [ ] On-demand TTL gate preserved: fresh cache = zero network; stale-fallback on failure
+- [ ] File + CLI contract: no server/daemon/MCP; JSON to stdout, errors to stderr; exit codes `0` clean / `1` served but degraded / `2` no usable data preserved
+- [ ] SOT precedence honored: overrides > OpenRouter catalog > LiteLLM; hand-typed prices only when attested; no guessed tokenizers; discovery data labeled `baseline: true`
+- [ ] On-demand TTL gate preserved: fresh cache = zero network; stale-fallback when the load-bearing source is unreachable
 - [ ] Hermetic tests: suite never hits the network; deterministic exit codes asserted
 
 ## Project Structure

@@ -173,7 +173,10 @@ run_hook() {
     local hook_name="$1"; shift
     local -a args=("$@")
     _get_hook_commands "$hook_name" | while IFS= read -r -d '' cmd; do
-        for kv in "${args[@]}"; do
+        # ${args[@]+...} guards the empty-array case: under `set -u`, bash 3.2
+        # (the macOS system bash) treats "${args[@]}" as unbound when empty, so
+        # any hook invoked without key=value arguments would abort the script.
+        for kv in ${args[@]+"${args[@]}"}; do
             local key="${kv%%=*}" val="${kv#*=}"
             cmd="${cmd//\{\{$key\}\}/$val}"
         done
