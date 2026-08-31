@@ -21,6 +21,12 @@ python ~/llm/llm-pricing-sot/fetch_pricing.py --force
 ```
 
 Interpretation:
-- `"baseline": false` / `"source": "override"` → what we actually pay (truth).
-- `"baseline": true` → discovery pricing (OpenRouter/LiteLLM) — baseline only.
-- Exit codes: `0` fresh, `1` stale, `2` no data.
+- `"baseline": false` → a model the SOT tracks. Use this price. `source` says where
+  it came from: `override` = an attested rate we pay; `openrouter`/`litellm` = the
+  live catalog price, refreshed automatically. Most tracked models read
+  `openrouter` by design — hand-typed prices are avoided because they rot.
+- `"baseline": true` → discovery pricing (OpenRouter/LiteLLM) — not a tracked
+  model; informational only.
+- `"degraded": true` → the answer is usable but stale or in `needs_review`.
+- Exit codes: `0` clean, `1` served but degraded, `2` no data. Canonical statement:
+  `.specify/memory/constitution.md` Principle III.

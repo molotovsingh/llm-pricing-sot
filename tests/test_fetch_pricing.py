@@ -5,6 +5,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -19,6 +20,7 @@ from fetch_pricing import (
     attestation_state,
     attach_catalog_baseline,
     DISCOVERY_PATH,
+    OVERRIDES_PATH,
     build_cache,
     main,
     emit,
@@ -35,6 +37,8 @@ from fetch_pricing import (
     validate_entry,
     _blended_cost,
     _endpoint_snapshot_path,
+    _exit_for,
+    _resolve_slug,
     _normalize_model,
     _normalize_openrouter,
 )
@@ -1135,3 +1139,182 @@ class TestQueryReview(unittest.TestCase):
     def test_no_cache_exits_2(self):
         code, _ = self._review()
         self.assertEqual(code, 2)
+
+
+class TestDeclaredPinIsAuthoritative(unittest.TestCase):
+    """A pin exists to make resolution deterministic; a broken pin must not guess."""
+
+    CATALOG = {"azure/gpt-4o": {"in": 9.9, "out": 99.0}}
+
+    def test_retired_pin_does_not_fall_back_to_fuzzy_match(self):
+        ov = {"gpt-4o": {"tokenizer": "tok", "openrouter_slug": "openai/gpt-4o"}}
+        self.assertIsNone(_resolve_slug(set(self.CATALOG), "gpt-4o", ov))
+
+    def test_retired_pin_yields_no_price_rather_than_another_models(self):
+        ov = {"gpt-4o": {"tokenizer": "tok", "openrouter_slug": "openai/gpt-4o"}}
+        result = attach_catalog_baseline(ov, self.CATALOG, {})
+        self.assertNotIn("in", result["gpt-4o"])
+        self.assertNotIn("catalog", result["gpt-4o"])
+
+    def test_unpinned_alias_still_matches_by_last_segment(self):
+        ov = {"gpt-4o": {"tokenizer": "tok"}}
+        self.assertEqual(_resolve_slug({"openai/gpt-4o"}, "gpt-4o", ov), "openai/gpt-4o")
+
+    def test_retired_pin_surfaces_as_needs_review_end_to_end(self):
+        with tempfile.TemporaryDirectory() as d:
+            cache_path = os.path.join(d, "pricing.json")
+            overrides_path = os.path.join(d, "overrides.json")
+            with open(overrides_path, "w", encoding="utf-8") as fh:
+                json.dump({"good": {"tokenizer": "tok", "openrouter_slug": "x/good"},
+                           "gpt-4o": {"tokenizer": "tok",
+                                      "openrouter_slug": "openai/gpt-4o"}}, fh)
+            catalog = json.dumps({"data": [
+                {"id": "x/good", "pricing": {"prompt": "0.000003", "completion": "0.000015"}},
+                {"id": "azure/gpt-4o", "pricing": {"prompt": "0.0000099", "completion": "0.000099"}}]})
+            code = run(cache_path=cache_path, overrides_path=overrides_path,
+                       openrouter_fetcher=lambda u: catalog,
+                       litellm_fetcher=lambda u: json.dumps({}))
+            self.assertEqual(code, 1)
+            with open(cache_path, "r", encoding="utf-8") as fh:
+                cache = json.load(fh)
+            self.assertNotIn("gpt-4o", cache["models"])
+            self.assertIn("gpt-4o", cache["needs_review"])
+
+
+class TestDegradedIsFirstClass(unittest.TestCase):
+    """Degradation is independent of age; a fresh cache can still be degraded."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.cache_path = os.path.join(self.dir.name, "pricing.json")
+        self.overrides_path = os.path.join(self.dir.name, "overrides.json")
+        with open(self.overrides_path, "w", encoding="utf-8") as fh:
+            json.dump({}, fh)
+        emit(build_cache(
+            {"flagged": {"in": 1.75, "out": 14.0, "tokenizer": "tok", "source": "openrouter",
+                         "review": "unattested-price-ignored"},
+             "clean": {"in": 1.0, "out": 2.0, "tokenizer": "tok", "source": "openrouter"}},
+            24, _now_iso(), "fresh", ["flagged"]), self.cache_path)
+
+    def _query(self, action, model=None):
+        args = argparse.Namespace(action=action, model=model, offline=True, ttl_hours=24)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            code = query_main(args, cache_path=self.cache_path,
+                              overrides_path=self.overrides_path,
+                              discovery_path=os.path.join(self.dir.name, "d.json"))
+        return code, json.loads(buf.getvalue())
+
+    def test_exit_for_separates_age_from_degradation(self):
+        self.assertEqual(_exit_for("fresh"), 0)
+        self.assertEqual(_exit_for("fresh", degraded=True), 1)
+        self.assertEqual(_exit_for("stale"), 1)
+        self.assertEqual(_exit_for("no-data", degraded=True), 2)
+
+    def test_flagged_model_price_is_not_a_success(self):
+        code, data = self._query("price", "flagged")
+        self.assertEqual(code, 1)
+        self.assertTrue(data["degraded"])
+        self.assertEqual(data["freshness"], "fresh")
+
+    def test_clean_model_price_is_a_success(self):
+        code, data = self._query("price", "clean")
+        self.assertEqual(code, 0)
+        self.assertFalse(data["degraded"])
+
+    def test_review_reports_true_freshness_and_still_exits_1(self):
+        code, data = self._query("review")
+        self.assertEqual(code, 1)
+        self.assertEqual(data["freshness"], "fresh")
+        self.assertTrue(data["degraded"])
+
+    def test_fresh_action_reports_the_queue(self):
+        code, data = self._query("fresh")
+        self.assertEqual(code, 1)
+        self.assertEqual(data["needs_review"], 1)
+
+
+class TestQueryTtlDoesNotPersist(unittest.TestCase):
+    def test_tight_query_ttl_is_read_time_only(self):
+        # Stamping a caller's TTL into the shared envelope would change every
+        # other consumer's refresh cadence.
+        with tempfile.TemporaryDirectory() as d:
+            cache_path = os.path.join(d, "pricing.json")
+            overrides_path = os.path.join(d, "overrides.json")
+            with open(overrides_path, "w", encoding="utf-8") as fh:
+                json.dump({"m": {"tokenizer": "tok", "openrouter_slug": "x/m"}}, fh)
+            three_hours_ago = datetime.now(timezone.utc) - timedelta(hours=3)
+            emit(build_cache({"m": {"in": 1.0, "out": 2.0, "tokenizer": "tok"}},
+                             24, _now_iso(three_hours_ago), "fresh"), cache_path)
+            catalog = json.dumps({"data": [{"id": "x/m", "pricing": {
+                "prompt": "0.000003", "completion": "0.000015"}}]})
+            args = argparse.Namespace(action="price", model="m", offline=False, ttl_hours=1)
+            with contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                query_main(args, openrouter_fetcher=lambda u: catalog,
+                           litellm_fetcher=lambda u: json.dumps({}),
+                           cache_path=cache_path, overrides_path=overrides_path,
+                           discovery_path=os.path.join(d, "d.json"),
+                           endpoints_dir=os.path.join(d, "eps"))
+            with open(cache_path, "r", encoding="utf-8") as fh:
+                self.assertEqual(json.load(fh)["ttl_hours"], 24)
+
+
+class TestShippedOverridesFile(unittest.TestCase):
+    """The real overrides.json is a contract; fixtures never exercise it.
+
+    Hermetic: reads the repo file, no network.
+    """
+
+    SPEC = re.compile(r"^(tiktoken|hf):[A-Za-z0-9._/-]+$")
+
+    @classmethod
+    def setUpClass(cls):
+        cls.entries = load_overrides(OVERRIDES_PATH)
+
+    def test_file_parses_and_is_not_empty(self):
+        self.assertGreater(len(self.entries), 0)
+
+    def test_documentation_keys_are_not_models(self):
+        self.assertFalse([k for k in self.entries if k.startswith("_")])
+
+    def test_every_entry_has_a_well_formed_tokenizer(self):
+        for mid, entry in self.entries.items():
+            with self.subTest(model=mid):
+                self.assertRegex(entry.get("tokenizer", ""), self.SPEC)
+
+    def test_fallback_is_well_formed_and_differs(self):
+        # The estimator rejects a fallback equal to the primary: it would retry
+        # the same failing tokenizer.
+        for mid, entry in self.entries.items():
+            if "fallback" in entry:
+                with self.subTest(model=mid):
+                    self.assertRegex(entry["fallback"], self.SPEC)
+                    self.assertNotEqual(entry["fallback"], entry["tokenizer"])
+
+    def test_pins_are_author_slug_shaped(self):
+        for mid, entry in self.entries.items():
+            if "openrouter_slug" in entry:
+                with self.subTest(model=mid):
+                    self.assertRegex(entry["openrouter_slug"], r"^[^/]+/[^/]+$")
+
+    def test_hand_typed_price_has_both_halves(self):
+        # Half a price is never usable: the merge treats it as price-less anyway.
+        for mid, entry in self.entries.items():
+            if "in" in entry or "out" in entry:
+                with self.subTest(model=mid):
+                    self.assertIn("in", entry)
+                    self.assertIn("out", entry)
+
+    def test_no_half_declared_attestation(self):
+        # Deliberately unattested is a tracked state (needs_review handles it).
+        # A *partial* attestation is not a policy choice, it is a mistake: the
+        # price is silently discarded while the file looks like it was claimed.
+        for mid, entry in self.entries.items():
+            declared = [k for k in ("negotiated", "note", "verified_at") if k in entry]
+            if declared:
+                with self.subTest(model=mid):
+                    self.assertEqual(len(declared), 3,
+                                     f"partial attestation: only {declared}")
+                    self.assertEqual(attestation_state(entry), "valid")

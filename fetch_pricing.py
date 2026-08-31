@@ -540,7 +540,11 @@ def run(ttl_hours=DEFAULT_TTL_HOURS, force=False,
                 return 1
             return 0
         # Refresh succeeded but nothing survived validation -> hard failure.
-        print("error: refresh produced no valid models", file=sys.stderr)
+        # Name the overrides so the cause is actionable (a retired slug pin
+        # looks identical to a total outage from the exit code alone).
+        dropped = sorted(overrides)
+        detail = f" (no override survived validation: {', '.join(dropped)})" if dropped else ""
+        print(f"error: refresh produced no valid models{detail}", file=sys.stderr)
         return 2
 
     # The catalog is unreachable (FR-004/FR-005): serve stale if available, else fail.
@@ -668,15 +672,21 @@ def fetch_endpoints(slug, fetcher=_default_fetcher):
 def _resolve_slug(catalog_ids, model, overrides):
     """Resolve a model id to an OpenRouter slug (FR-002).
 
-    Order: exact catalog id match, overrides-declared `openrouter_slug`
-    (when present in the catalog), then a catalog last-segment match. Returns
-    None when unresolvable (caller falls back to the variant scan).
+    Order: exact catalog id match, overrides-declared `openrouter_slug`, then a
+    catalog last-segment match. Returns None when unresolvable (caller falls back
+    to the variant scan, or reports the override as unpriceable).
+
+    A declared `openrouter_slug` is authoritative: if the pin no longer resolves
+    the answer is None, never a last-segment guess. Prices are inherited from the
+    resolved row, so guessing after a retired pin would silently price a model
+    from a different one.
     """
     if model in catalog_ids:
         return model
     entry = (overrides or {}).get(model)
-    if isinstance(entry, dict) and entry.get("openrouter_slug") in catalog_ids:
-        return entry["openrouter_slug"]
+    if isinstance(entry, dict) and entry.get("openrouter_slug"):
+        pin = entry["openrouter_slug"]
+        return pin if pin in catalog_ids else None
     for mid in catalog_ids:
         if mid.rsplit("/", 1)[-1] == model:
             return mid
@@ -742,8 +752,17 @@ def _freshness_status(cache, ttl_hours, now):
     return "fresh" if is_fresh(cache, ttl_hours, now=now) else "stale"
 
 
-def _exit_for(freshness):
-    return {"fresh": 0, "stale": 1, "no-data": 2}[freshness]
+def _exit_for(freshness, degraded=False):
+    """Map an answer's age and its degradation to an exit code.
+
+    Degradation is independent of age: an entry can need review in a perfectly
+    fresh cache, and a consumer must not see success while using it.
+    """
+    if freshness == "no-data":
+        return 2
+    if degraded or freshness == "stale":
+        return 1
+    return 0
 
 
 def query_main(args, openrouter_fetcher=_default_fetcher, litellm_fetcher=_default_fetcher,
@@ -760,28 +779,36 @@ def query_main(args, openrouter_fetcher=_default_fetcher, litellm_fetcher=_defau
 
     def _refresh_cache_if_stale(cache):
         if (cache is None or not is_fresh(cache, ttl_hours, now=now)) and not offline:
+            # A query's --ttl-hours is a read-time gate for *this* caller. Stamping
+            # it into the shared envelope would change every other consumer's
+            # refresh cadence, so the cache keeps its own declared TTL.
+            declared = cache.get("ttl_hours") if isinstance(cache, dict) else None
+            if isinstance(declared, bool) or not isinstance(declared, int) or declared <= 0:
+                declared = DEFAULT_TTL_HOURS
             # Keep stdout clean for the JSON answer: refresh notes go to stderr.
             with contextlib.redirect_stdout(sys.stderr):
-                run(ttl_hours=ttl_hours, force=True, cache_path=cache_path,
+                run(ttl_hours=declared, force=True, cache_path=cache_path,
                     overrides_path=overrides_path, discovery_path=discovery_path,
                     openrouter_fetcher=openrouter_fetcher, litellm_fetcher=litellm_fetcher,
                     now=now)
             return _load_cache(cache_path)
         return cache
 
-    def _out(payload, freshness):
-        print(json.dumps(payload, sort_keys=True))
-        return _exit_for(freshness)
+    def _out(payload, freshness, degraded=False):
+        print(json.dumps(dict(payload, degraded=bool(degraded)), sort_keys=True))
+        return _exit_for(freshness, degraded)
 
     cache = _load_cache(cache_path)
     cache = _refresh_cache_if_stale(cache)
     freshness = _freshness_status(cache, ttl_hours, now)
     cache_models = (cache or {}).get("models", {}) if isinstance(cache, dict) else {}
+    flagged = (cache.get("needs_review") or []) if isinstance(cache, dict) else []
 
     if action == "fresh":
         fetched_at = cache.get("fetched_at") if isinstance(cache, dict) else None
         return _out({"freshness": freshness, "fetched_at": fetched_at,
-                     "ttl_hours": ttl_hours}, freshness)
+                     "ttl_hours": ttl_hours, "needs_review": len(flagged)},
+                    freshness, bool(flagged))
 
     if action == "review":
         if cache is None:
@@ -811,7 +838,7 @@ def query_main(args, openrouter_fetcher=_default_fetcher, litellm_fetcher=_defau
                       f"{_pair(r['serving_in'], r['serving_out']):>14}  {r['reason']}",
                       file=sys.stderr)
         return _out({"needs_review": rows, "freshness": freshness},
-                    "stale" if rows else freshness)
+                    freshness, bool(rows))
 
     disc = ensure_discovery(offline, ttl_hours, now,
                             openrouter_fetcher, litellm_fetcher, discovery_path)
@@ -831,7 +858,7 @@ def query_main(args, openrouter_fetcher=_default_fetcher, litellm_fetcher=_defau
                     models.append({"model": mid, "in": e.get("in"), "out": e.get("out"),
                                    "source": layer_name, "baseline": True})
         status = freshness if freshness != "no-data" else disc_freshness
-        return _out({"freshness": freshness, "models": models}, status)
+        return _out({"freshness": freshness, "models": models}, status, bool(flagged))
 
     if model is None:
         print(json.dumps({"error": "model argument required for %s" % action}), file=sys.stderr)
@@ -841,7 +868,7 @@ def query_main(args, openrouter_fetcher=_default_fetcher, litellm_fetcher=_defau
         if model in cache_models:
             entry = dict(cache_models[model])
             entry.update({"model": model, "baseline": False, "freshness": freshness})
-            return _out(entry, freshness)
+            return _out(entry, freshness, bool(entry.get("review")))
         if disc is not None:
             # Prefer an exact id match over a provider variant.
             for layer_name in ("litellm", "openrouter"):
@@ -882,7 +909,8 @@ def query_main(args, openrouter_fetcher=_default_fetcher, litellm_fetcher=_defau
                            "freshness": ep_freshness}
                 if "in_cache_read" in cheapest:
                     payload["in_cache_read"] = cheapest["in_cache_read"]
-                return _out(payload, ep_freshness)
+                return _out(payload, ep_freshness,
+                            bool((authoritative or {}).get("review")))
         # Fallback: LiteLLM/OpenRouter variant scan for vendor-direct models (FR-004).
         variants = []
         if disc is not None:
@@ -898,7 +926,8 @@ def query_main(args, openrouter_fetcher=_default_fetcher, litellm_fetcher=_defau
                      "out": cheapest["out"], "source": cheapest["source"], "baseline": True,
                      "fallback": True, "authoritative": authoritative,
                      "ranked_by": f"blended-{CHEAPEST_IO_RATIO}:1",
-                     "variants": len(variants), "freshness": disc_freshness}, disc_freshness)
+                     "variants": len(variants), "freshness": disc_freshness},
+                    disc_freshness, bool((authoritative or {}).get("review")))
 
     print(json.dumps({"error": "unknown action %r" % action}), file=sys.stderr)
     return 2

@@ -49,6 +49,9 @@ All open items resolved. Decisions below.
   unchanged; new `fetch_pricing.py query <action> [model] [--offline]`. `query`
   answers print one JSON object to stdout; notes/errors to stderr; exit codes
   `0` fresh / `1` stale / `2` no data (not-found uses `2` with `found: false`).
+  *(Superseded: exit `1` was later widened from "stale" to "served but degraded"
+  — stale **or** an entry in `needs_review`. This is a point-in-time decision
+  record; the live contract is constitution Principle III.)*
 - **Rationale**: existing consumers (llm-cost-estimator) call the bare command and
   depend on its exit codes — must not break. One entrypoint keeps the SOT logic
   in one place.
