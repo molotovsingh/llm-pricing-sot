@@ -293,7 +293,11 @@ class TestUnregisteredMarkers(unittest.TestCase):
         # constructs a Path only for actual .md hits. rglob post-filtering
         # walks the whole object tree first.
         for dirpath, dirnames, filenames in os.walk(REPO_ROOT):
-            dirnames[:] = [d for d in dirnames if d != ".git"]
+            # Never descend into .git or autoresearch/ session worktrees: the
+            # harness clones the whole repo inside autoresearch/<id>/, and those
+            # copies of governed documents are enforced at their canonical
+            # (registered) locations, not as separate unregistered files.
+            dirnames[:] = [d for d in dirnames if d not in (".git", "autoresearch")]
             for name in filenames:
                 if name.endswith(".md"):
                     yield pathlib.Path(dirpath, name)
