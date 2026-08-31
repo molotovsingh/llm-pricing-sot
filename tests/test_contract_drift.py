@@ -289,10 +289,14 @@ class TestUnregisteredMarkers(unittest.TestCase):
 
     @staticmethod
     def _markdown_files():
-        for path in REPO_ROOT.rglob("*.md"):
-            if ".git" in path.parts:
-                continue
-            yield path
+        # os.walk with descent-time pruning: never enters .git at all, and
+        # constructs a Path only for actual .md hits. rglob post-filtering
+        # walks the whole object tree first.
+        for dirpath, dirnames, filenames in os.walk(REPO_ROOT):
+            dirnames[:] = [d for d in dirnames if d != ".git"]
+            for name in filenames:
+                if name.endswith(".md"):
+                    yield pathlib.Path(dirpath, name)
 
     def test_no_real_block_in_an_unregistered_file(self):
         for path in self._markdown_files():
