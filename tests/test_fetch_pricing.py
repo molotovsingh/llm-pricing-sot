@@ -1,6 +1,8 @@
 """Unit tests for the fetch_pricing CLI argument parsing (T-001)."""
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import tempfile
@@ -12,7 +14,13 @@ import urllib.request
 
 from fetch_pricing import (
     DEFAULT_TTL_HOURS,
+    ATTESTATION_MAX_AGE_DAYS,
+    DRIFT_TOLERANCE,
+    attestation_state,
+    attach_catalog_baseline,
+    DISCOVERY_PATH,
     build_cache,
+    main,
     emit,
     fetch_litellm,
     fetch_openrouter,
@@ -21,6 +29,7 @@ from fetch_pricing import (
     load_overrides,
     merge,
     parse_args,
+    _now_iso,
     query_main,
     run,
     validate_entry,
@@ -170,6 +179,141 @@ class TestMerge(unittest.TestCase):
         self.assertNotIn("b", result["a"])
 
 
+def _attested(price_in, price_out, verified_at="2026-08-01"):
+    """An override price with a complete attestation, so it is honoured."""
+    return {"in": price_in, "out": price_out, "negotiated": True,
+            "note": "direct vendor rate", "verified_at": verified_at}
+
+
+class TestAttachCatalogBaseline(unittest.TestCase):
+    """Overrides inherit the catalog price unless they attest to their own."""
+
+    CATALOG = {"openai/gpt-5.2": {"in": 1.75, "out": 14.0, "source": "openrouter"}}
+
+    def test_resolves_by_last_segment(self):
+        result = attach_catalog_baseline({"gpt-5.2": _attested(0.4, 1.6)}, self.CATALOG, {})
+        self.assertEqual(result["gpt-5.2"]["catalog"]["slug"], "openai/gpt-5.2")
+        self.assertEqual(result["gpt-5.2"]["catalog"]["in"], 1.75)
+
+    def test_resolves_by_declared_slug(self):
+        catalog = {"anthropic/claude-haiku-4.5": {"in": 1.0, "out": 5.0}}
+        overrides = {"claude-haiku": {"tokenizer": "tok",
+                                      "openrouter_slug": "anthropic/claude-haiku-4.5"}}
+        result = attach_catalog_baseline(overrides, catalog, {})
+        self.assertEqual(result["claude-haiku"]["catalog"]["slug"],
+                         "anthropic/claude-haiku-4.5")
+
+    def test_falls_back_to_litellm_exact_id(self):
+        litellm = {"vendor-only": {"in": 2.0, "out": 4.0, "source": "litellm"}}
+        result = attach_catalog_baseline({"vendor-only": {"tokenizer": "tok"}}, {}, litellm)
+        self.assertEqual(result["vendor-only"]["catalog"]["source"], "litellm")
+        self.assertEqual(result["vendor-only"]["in"], 2.0)
+
+    # ---- inheritance is the default ----
+
+    def test_priceless_override_inherits_catalog_price(self):
+        result = attach_catalog_baseline({"gpt-5.2": {"tokenizer": "tok"}}, self.CATALOG, {})
+        self.assertEqual(result["gpt-5.2"]["in"], 1.75)
+        self.assertEqual(result["gpt-5.2"]["out"], 14.0)
+        self.assertEqual(result["gpt-5.2"]["source"], "openrouter")
+        self.assertNotIn("review", result["gpt-5.2"])
+
+    def test_partial_price_is_treated_as_priceless(self):
+        result = attach_catalog_baseline({"gpt-5.2": {"in": 0.4}}, self.CATALOG, {})
+        self.assertEqual(result["gpt-5.2"]["out"], 14.0)
+        self.assertEqual(result["gpt-5.2"]["source"], "openrouter")
+
+    # ---- an unattested price is not trusted ----
+
+    def test_unattested_price_is_discarded_for_catalog(self):
+        result = attach_catalog_baseline({"gpt-5.2": {"in": 0.4, "out": 1.6}}, self.CATALOG, {})
+        self.assertEqual(result["gpt-5.2"]["in"], 1.75)
+        self.assertEqual(result["gpt-5.2"]["source"], "openrouter")
+        self.assertEqual(result["gpt-5.2"]["review"], "unattested-price-ignored")
+
+    def test_incomplete_attestation_is_not_trusted(self):
+        for missing in ("note", "verified_at", "negotiated"):
+            entry = _attested(0.4, 1.6)
+            del entry[missing]
+            result = attach_catalog_baseline({"gpt-5.2": entry}, self.CATALOG, {})
+            self.assertEqual(result["gpt-5.2"]["in"], 1.75, f"missing {missing}")
+
+    def test_future_verified_at_is_not_trusted(self):
+        entry = _attested(0.4, 1.6, verified_at="2099-01-01")
+        result = attach_catalog_baseline({"gpt-5.2": entry}, self.CATALOG, {})
+        self.assertEqual(result["gpt-5.2"]["review"], "unattested-price-ignored")
+
+    def test_unattested_price_kept_when_catalog_cannot_replace_it(self):
+        # Nothing to inherit from, so the price survives but is flagged.
+        result = attach_catalog_baseline({"private": {"in": 1.0, "out": 2.0}}, self.CATALOG, {})
+        self.assertEqual(result["private"]["in"], 1.0)
+        self.assertNotIn("catalog", result["private"])
+        self.assertEqual(result["private"]["review"], "unverifiable-price")
+
+    # ---- an attested price is authoritative ----
+
+    def test_attested_price_stays_authoritative(self):
+        result = attach_catalog_baseline({"gpt-5.2": _attested(0.4, 1.6)}, self.CATALOG, {})
+        self.assertEqual(result["gpt-5.2"]["in"], 0.4)
+        self.assertEqual(result["gpt-5.2"]["out"], 1.6)
+        self.assertEqual(result["gpt-5.2"]["source"], "override")
+        self.assertNotIn("review", result["gpt-5.2"])
+
+    def test_expired_attestation_is_honoured_but_flagged(self):
+        # Reverting to catalog would silently change the price we believe we pay,
+        # so the number stands and the attestation is what gets reported.
+        entry = _attested(0.4, 1.6, verified_at="2020-01-01")
+        result = attach_catalog_baseline({"gpt-5.2": entry}, self.CATALOG, {})
+        self.assertEqual(result["gpt-5.2"]["in"], 0.4)
+        self.assertEqual(result["gpt-5.2"]["review"], "attestation-expired")
+
+    # ---- drift is informational on an attested price ----
+
+    def test_drift_recorded_beyond_tolerance(self):
+        result = attach_catalog_baseline({"gpt-5.2": _attested(0.4, 1.6)}, self.CATALOG, {})
+        self.assertIn("in", result["gpt-5.2"]["drift"])
+        self.assertIn("out", result["gpt-5.2"]["drift"])
+
+    def test_no_drift_when_prices_agree(self):
+        result = attach_catalog_baseline({"gpt-5.2": _attested(1.75, 14.0)}, self.CATALOG, {})
+        self.assertNotIn("drift", result["gpt-5.2"])
+
+    def test_no_drift_within_tolerance(self):
+        nudge = 1.75 * (1 + DRIFT_TOLERANCE / 2)
+        result = attach_catalog_baseline({"gpt-5.2": _attested(nudge, 14.0)}, self.CATALOG, {})
+        self.assertNotIn("drift", result["gpt-5.2"])
+
+    def test_zero_price_drift_stays_json_safe(self):
+        result = attach_catalog_baseline({"gpt-5.2": _attested(0.0, 0.0)}, self.CATALOG, {})
+        self.assertEqual(result["gpt-5.2"]["drift"]["in"], 1.0)
+        self.assertNotIn("Infinity", json.dumps(result))
+
+
+class TestAttestationState(unittest.TestCase):
+    NOW = datetime(2026, 8, 30, tzinfo=timezone.utc)
+
+    def test_complete_and_recent_is_valid(self):
+        self.assertEqual(attestation_state(_attested(1.0, 2.0), self.NOW), "valid")
+
+    def test_old_is_expired(self):
+        entry = _attested(1.0, 2.0, verified_at="2020-01-01")
+        self.assertEqual(attestation_state(entry, self.NOW), "expired")
+
+    def test_boundary_day_is_still_valid(self):
+        edge = self.NOW - timedelta(days=ATTESTATION_MAX_AGE_DAYS)
+        entry = _attested(1.0, 2.0, verified_at=edge.strftime("%Y-%m-%d"))
+        self.assertEqual(attestation_state(entry, self.NOW), "valid")
+
+    def test_blank_note_is_missing(self):
+        entry = _attested(1.0, 2.0)
+        entry["note"] = "   "
+        self.assertEqual(attestation_state(entry, self.NOW), "missing")
+
+    def test_unparseable_date_is_missing(self):
+        entry = _attested(1.0, 2.0, verified_at="last tuesday")
+        self.assertEqual(attestation_state(entry, self.NOW), "missing")
+
+
 class TestValidateEntry(unittest.TestCase):
     """T-005: validation of emitted entries (NFR-005) and batch filter."""
 
@@ -188,6 +332,16 @@ class TestValidateEntry(unittest.TestCase):
         self.assertFalse(validate_entry({"in": "3", "out": 15.0, "tokenizer": "tok"}))
         self.assertFalse(validate_entry({"in": 3.0, "tokenizer": "tok"}))
         self.assertFalse(validate_entry({"out": 15.0, "tokenizer": "tok"}))
+
+    def test_rejects_negative_catalog_price(self):
+        entry = {"in": 3.0, "out": 15.0, "tokenizer": "tok",
+                 "catalog": {"slug": "a/b", "source": "openrouter", "in": -1.0}}
+        self.assertFalse(validate_entry(entry))
+
+    def test_accepts_catalog_row_without_prices(self):
+        entry = {"in": 3.0, "out": 15.0, "tokenizer": "tok",
+                 "catalog": {"slug": "a/b", "source": "openrouter"}}
+        self.assertTrue(validate_entry(entry))
 
     def test_alternatives_must_be_valid(self):
         # R3: alternatives with a negative price are rejected.
@@ -320,23 +474,76 @@ class TestRunOrchestration(unittest.TestCase):
         with open(self.cache_path, "r", encoding="utf-8") as fh:
             cache = json.load(fh)
         self.assertEqual(cache["freshness"], "fresh")
-        self.assertEqual(cache["models"]["model-a"]["in"], 3.0)  # from litellm
+        # A price-less override inherits from the catalog row it resolved to, so
+        # `source` names that layer rather than claiming to be authoritative.
+        self.assertEqual(cache["models"]["model-a"]["in"], 3.0)
         self.assertEqual(cache["models"]["model-a"]["tokenizer"], "hf:tok")
-        self.assertEqual(cache["models"]["model-a"]["source"], "override")
+        self.assertEqual(cache["models"]["model-a"]["source"], "openrouter")
 
-    def test_override_only_model_source_is_override(self):
-        # A model present only in overrides gets source=override (not null).
+    OPENROUTER_GPT52 = {"data": [{"id": "openai/gpt-5.2",
+                                  "pricing": {"prompt": "0.00000175", "completion": "0.000014"}}]}
+
+    def _run_with_override(self, override):
         with open(self.overrides_path, "w", encoding="utf-8") as fh:
-            json.dump({"only": {"in": 1.0, "out": 2.0, "tokenizer": "tok"}}, fh)
+            json.dump({"gpt-5.2": override}, fh)
+        code = run(
+            cache_path=self.cache_path, overrides_path=self.overrides_path,
+            openrouter_fetcher=self._ok_fetcher(self.OPENROUTER_GPT52),
+            litellm_fetcher=self._ok_fetcher({}), now=self.now,
+        )
+        with open(self.cache_path, "r", encoding="utf-8") as fh:
+            return code, json.load(fh)
+
+    def test_review_ids_rolled_up_in_payload(self):
+        _, cache = self._run_with_override({"tokenizer": "tok", "in": 0.4, "out": 1.6})
+        self.assertEqual(cache["needs_review"], ["gpt-5.2"])
+
+    def test_unattested_price_is_replaced_by_catalog(self):
+        # The whole point: a stale transcription cannot survive a refresh.
+        code, cache = self._run_with_override({"tokenizer": "tok", "in": 0.4, "out": 1.6})
+        self.assertEqual(code, 1)
+        entry = cache["models"]["gpt-5.2"]
+        self.assertEqual(entry["in"], 1.75)
+        self.assertEqual(entry["source"], "openrouter")
+        self.assertEqual(entry["review"], "unattested-price-ignored")
+
+    def test_emitted_attested_override_carries_catalog_and_drift(self):
+        code, cache = self._run_with_override({
+            "tokenizer": "tok", "in": 0.4, "out": 1.6, "negotiated": True,
+            "note": "direct vendor rate", "verified_at": "2025-12-01"})
+        self.assertEqual(code, 0)
+        entry = cache["models"]["gpt-5.2"]
+        self.assertEqual(entry["in"], 0.4)
+        self.assertEqual(entry["source"], "override")
+        self.assertEqual(entry["catalog"]["slug"], "openai/gpt-5.2")
+        self.assertEqual(entry["catalog"]["out"], 14.0)
+        self.assertIn("out", entry["drift"])
+
+    def _run_catalogless(self, override):
+        with open(self.overrides_path, "w", encoding="utf-8") as fh:
+            json.dump({"only": override}, fh)
         code = run(
             cache_path=self.cache_path, overrides_path=self.overrides_path,
             openrouter_fetcher=self._ok_fetcher({"data": []}),
             litellm_fetcher=self._ok_fetcher({}), now=self.now,
         )
-        self.assertEqual(code, 0)
         with open(self.cache_path, "r", encoding="utf-8") as fh:
-            cache = json.load(fh)
+            return code, json.load(fh)
+
+    def test_attested_override_only_model_source_is_override(self):
+        code, cache = self._run_catalogless({
+            "in": 1.0, "out": 2.0, "tokenizer": "tok", "negotiated": True,
+            "note": "private deployment", "verified_at": "2025-12-01"})
+        self.assertEqual(code, 0)
         self.assertEqual(cache["models"]["only"]["source"], "override")
+
+    def test_unverifiable_price_survives_but_is_flagged(self):
+        # No catalog row to fall back to, so the price stands — but a number
+        # nothing can check is exactly what needs a human to attest it.
+        code, cache = self._run_catalogless({"in": 1.0, "out": 2.0, "tokenizer": "tok"})
+        self.assertEqual(code, 1)
+        self.assertEqual(cache["models"]["only"]["in"], 1.0)
+        self.assertEqual(cache["models"]["only"]["review"], "unverifiable-price")
 
     def test_source_failure_serves_stale_exit1(self):
         self._write_cache(48, freshness="fresh")
@@ -495,7 +702,9 @@ class TestQueryPrice(QueryTestBase):
         ll_fetcher = lambda u: json.dumps({"gpt-4o": {"input_cost_per_token": 0.0000025, "output_cost_per_token": 0.00001}})
         code, data = self._run("price", "gpt-4o", or_fetcher=or_fetcher, ll_fetcher=ll_fetcher)
         self.assertEqual(code, 0)
-        self.assertEqual(data["in"], 2.5)
+        # Inherited from the resolved OpenRouter row (3.0), not LiteLLM's 2.5:
+        # the price and the `catalog` row it is compared against must agree.
+        self.assertEqual(data["in"], 3.0)
         self.assertFalse(data["baseline"])
         self.assertTrue(os.path.exists(self.cache_path))
         self.assertTrue(os.path.exists(self.discovery_path))
@@ -703,3 +912,121 @@ class TestBaselineCacheFields(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestOverridesFileDocumentation(unittest.TestCase):
+    def test_underscore_keys_are_not_models(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "overrides.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump({"_comment": "docs", "m": {"tokenizer": "tok"}}, fh)
+            self.assertEqual(list(load_overrides(path)), ["m"])
+
+
+class TestReviewSurvivesCacheHit(unittest.TestCase):
+    """A review flag must not go silent for the whole TTL window on a cache hit."""
+
+    def test_fresh_cached_review_still_exits_1(self):
+        with tempfile.TemporaryDirectory() as d:
+            cache_path = os.path.join(d, "pricing.json")
+            emit(build_cache({"m": {"in": 1.0, "out": 2.0, "tokenizer": "tok"}},
+                             24, _now_iso(), "fresh", ["m"]), cache_path)
+            def boom(url):
+                raise AssertionError("cache-hit path must not touch the network")
+            code = run(cache_path=cache_path, openrouter_fetcher=boom, litellm_fetcher=boom)
+            self.assertEqual(code, 1)
+
+    def test_fresh_cached_without_review_exits_0(self):
+        with tempfile.TemporaryDirectory() as d:
+            cache_path = os.path.join(d, "pricing.json")
+            emit(build_cache({"m": {"in": 1.0, "out": 2.0, "tokenizer": "tok"}},
+                             24, _now_iso(), "fresh"), cache_path)
+            self.assertEqual(run(cache_path=cache_path), 0)
+
+
+class TestPartialSourceOutage(unittest.TestCase):
+    """LiteLLM is a demoted fallback; losing it must not void a healthy refresh."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.cache_path = os.path.join(self.dir.name, "pricing.json")
+        self.discovery_path = os.path.join(self.dir.name, "discovery.json")
+        self.overrides_path = os.path.join(self.dir.name, "overrides.json")
+        with open(self.overrides_path, "w", encoding="utf-8") as fh:
+            json.dump({"m": {"tokenizer": "tok", "openrouter_slug": "x/m"}}, fh)
+        self.openrouter = json.dumps(
+            {"data": [{"id": "x/m", "pricing": {"prompt": "0.000003", "completion": "0.000015"}}]})
+
+    @staticmethod
+    def _down(url):
+        raise OSError("source unavailable")
+
+    def test_litellm_outage_still_refreshes(self):
+        code = run(cache_path=self.cache_path, overrides_path=self.overrides_path,
+                   discovery_path=self.discovery_path,
+                   openrouter_fetcher=lambda u: self.openrouter, litellm_fetcher=self._down)
+        self.assertEqual(code, 0)
+        with open(self.cache_path, "r", encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh)["models"]["m"]["in"], 3.0)
+
+    def test_litellm_outage_reuses_last_known_layer(self):
+        with open(self.discovery_path, "w", encoding="utf-8") as fh:
+            json.dump({"fetched_at": _now_iso(), "openrouter": {},
+                       "litellm": {"legacy": {"in": 9.0, "out": 9.0}}}, fh)
+        run(cache_path=self.cache_path, overrides_path=self.overrides_path,
+            discovery_path=self.discovery_path,
+            openrouter_fetcher=lambda u: self.openrouter, litellm_fetcher=self._down)
+        with open(self.discovery_path, "r", encoding="utf-8") as fh:
+            self.assertIn("legacy", json.load(fh)["litellm"])
+
+    def test_openrouter_outage_still_falls_back_to_stale(self):
+        # The catalog is load-bearing for slug resolution and price inheritance.
+        code = run(cache_path=self.cache_path, overrides_path=self.overrides_path,
+                   openrouter_fetcher=self._down, litellm_fetcher=lambda u: json.dumps({}))
+        self.assertEqual(code, 2)
+
+
+class TestAtomicWrite(unittest.TestCase):
+    def test_emit_leaves_no_temp_files(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "cache", "pricing.json")
+            emit(build_cache({}, 24, _now_iso(), "fresh"), path)
+            self.assertEqual(os.listdir(os.path.dirname(path)), ["pricing.json"])
+
+    def test_failed_write_does_not_clobber_existing(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "pricing.json")
+            emit(build_cache({"a": {"in": 1.0}}, 24, _now_iso(), "fresh"), path)
+            unserializable = {"models": {"x": object()}}
+            with self.assertRaises(TypeError):
+                emit(unserializable, path)
+            with open(path, "r", encoding="utf-8") as fh:
+                self.assertIn("a", json.load(fh)["models"])
+            self.assertEqual(os.listdir(d), ["pricing.json"])
+
+
+class TestCliWiring(unittest.TestCase):
+    def test_plain_run_refreshes_the_discovery_sidecar(self):
+        with mock.patch("fetch_pricing.run", return_value=0) as fake_run:
+            main(["--force"])
+        self.assertEqual(fake_run.call_args.kwargs["discovery_path"], DISCOVERY_PATH)
+
+    def test_query_honours_ttl_hours(self):
+        with tempfile.TemporaryDirectory() as d:
+            cache_path = os.path.join(d, "pricing.json")
+            now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+            two_hours_old = (now - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            emit(build_cache({}, 24, two_hours_old, "fresh"), cache_path)
+
+            def freshness_with(ttl):
+                args = argparse.Namespace(action="fresh", model=None, offline=True,
+                                          ttl_hours=ttl)
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    query_main(args, now=now, cache_path=cache_path,
+                               discovery_path=os.path.join(d, "discovery.json"))
+                return json.loads(buf.getvalue())["freshness"]
+
+            self.assertEqual(freshness_with(24), "fresh")
+            self.assertEqual(freshness_with(1), "stale")

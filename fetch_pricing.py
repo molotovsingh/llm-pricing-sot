@@ -13,10 +13,20 @@ import json
 import os
 import re
 import sys
+import tempfile
 import urllib.request
 from datetime import datetime, timezone
 
 DEFAULT_TTL_HOURS = 24
+
+# Relative divergence between an override and its catalog baseline above which
+# the override is flagged as drifted.
+DRIFT_TOLERANCE = 0.05
+
+# How long an override's `verified_at` attestation is trusted before it is
+# reported for re-confirmation. Without expiry, `negotiated: true` is a
+# permanent mute button and hand-typed prices rot exactly as before.
+ATTESTATION_MAX_AGE_DAYS = 90
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 INVOCATION_SCRIPT_DIR = _SCRIPT_DIR
@@ -79,9 +89,11 @@ def load_overrides(path=OVERRIDES_PATH):
     if not isinstance(data, dict):
         return {}
     # Tag overrides as the winning layer so merge records source correctly.
+    # Underscore-prefixed keys are file documentation, not models.
     return {
         mid: {**entry, "source": "override"} if isinstance(entry, dict) else entry
         for mid, entry in data.items()
+        if not mid.startswith("_")
     }
 
 
@@ -195,6 +207,116 @@ def merge(layers):
     return merged
 
 
+def _relative_drift(ours, theirs):
+    """Normalized divergence in [0, 1] between two prices, or None if incomparable.
+
+    Symmetric (divides by the larger value) so the result stays finite and
+    JSON-safe even when one side is zero.
+    """
+    if not _is_non_negative_num(ours) or not _is_non_negative_num(theirs):
+        return None
+    largest = max(ours, theirs)
+    if largest == 0:
+        return None
+    return abs(theirs - ours) / largest
+
+
+def attestation_state(entry, now=None):
+    """Classify an override's price attestation: valid / expired / missing.
+
+    A hand-typed price is trusted only when the entry attests to it with
+    `negotiated: true`, a non-empty `note`, and a parseable `verified_at`. A
+    future-dated or unparseable `verified_at` is treated as missing.
+    """
+    if entry.get("negotiated") is not True:
+        return "missing"
+    note = entry.get("note")
+    if not isinstance(note, str) or not note.strip():
+        return "missing"
+    verified_at = _parse_iso_utc(entry.get("verified_at"))
+    if verified_at is None:
+        return "missing"
+    if now is None:
+        now = datetime.now(timezone.utc)
+    age_days = (now - verified_at).total_seconds() / 86400
+    if age_days < 0:
+        return "missing"
+    return "expired" if age_days > ATTESTATION_MAX_AGE_DAYS else "valid"
+
+
+def attach_catalog_baseline(overrides, openrouter_layer, litellm_layer, now=None):
+    """Resolve each override against the catalog: inherit price, or honour an attested one.
+
+    An override always owns the tokenizer mapping (no source supplies one). Its
+    price is optional, and unattested prices are not trusted:
+
+    - **No `in`/`out`** -> inherit the catalog price; `source` names that layer.
+    - **Hand-typed price WITH a valid attestation** -> honoured as authoritative.
+      Divergence from catalog is expected here, so it is recorded as `drift` for
+      information only.
+    - **Hand-typed price WITHOUT one** -> the price is *discarded* and the catalog
+      price inherited, flagged `review: unattested-price-ignored`. This is what
+      stops a stale transcription from surviving a refresh.
+
+    The catalog row is attached as `catalog`, not `baseline`: the query surface
+    already uses a boolean `baseline` flag to mark discovery-sourced answers.
+    """
+    catalog = openrouter_layer or {}
+    litellm = litellm_layer or {}
+    catalog_ids = set(catalog)
+    linked = {}
+    for mid, entry in overrides.items():
+        if not isinstance(entry, dict):
+            linked[mid] = entry
+            continue
+        entry = {k: v for k, v in entry.items() if k != "openrouter_slug"}
+        prices_its_own = all(_is_non_negative_num(entry.get(f)) for f in ("in", "out"))
+        attestation = attestation_state(entry, now) if prices_its_own else "missing"
+
+        slug = _resolve_slug(catalog_ids, mid, overrides)
+        if slug is not None:
+            base, base_source = catalog[slug], "openrouter"
+        elif mid in litellm:
+            base, base_source, slug = litellm[mid], "litellm", mid
+        else:
+            base, base_source = None, None
+        inheritable = base is not None and all(base.get(f) is not None for f in ("in", "out"))
+
+        # An unattested price can only be dropped if the catalog can replace it.
+        honour = prices_its_own and (attestation != "missing" or not inheritable)
+
+        if base is None:
+            if prices_its_own and attestation != "valid":
+                entry["review"] = "unverifiable-price"
+            linked[mid] = entry
+            continue
+
+        catalog_row = {"slug": slug, "source": base_source}
+        drift = {}
+        for field in ("in", "out"):
+            if base.get(field) is None:
+                continue
+            catalog_row[field] = base[field]
+            if honour:
+                divergence = _relative_drift(entry.get(field), base[field])
+                if divergence is not None and divergence > DRIFT_TOLERANCE:
+                    drift[field] = round(divergence, 4)
+            else:
+                entry[field] = base[field]
+        entry["catalog"] = catalog_row
+        entry["source"] = "override" if honour else base_source
+        if drift:
+            entry["drift"] = drift
+        if prices_its_own and not honour:
+            entry["review"] = "unattested-price-ignored"
+        elif honour and attestation == "expired":
+            entry["review"] = "attestation-expired"
+        elif honour and attestation == "missing":
+            entry["review"] = "unverifiable-price"
+        linked[mid] = entry
+    return linked
+
+
 def _is_non_negative_num(value):
     """True if value is a number >= 0 (bool, None and non-numerics are invalid)."""
     if isinstance(value, bool):
@@ -217,6 +339,13 @@ def validate_entry(entry):
         return False
     if not _is_non_negative_num(entry.get("in")) or not _is_non_negative_num(entry.get("out")):
         return False
+    catalog_row = entry.get("catalog")
+    if catalog_row is not None:
+        if not isinstance(catalog_row, dict):
+            return False
+        for field in ("in", "out"):
+            if field in catalog_row and not _is_non_negative_num(catalog_row[field]):
+                return False
     for alt in entry.get("alternatives", []) or []:
         if not isinstance(alt, dict):
             return False
@@ -265,21 +394,52 @@ def is_fresh(cache, ttl_hours=DEFAULT_TTL_HOURS, now=None):
     return age_seconds < ttl_hours * 3600
 
 
-def build_cache(models, ttl_hours, fetched_at, freshness):
-    """Build the cache/pricing.json payload (FR-001, FR-006, FR-008)."""
+def build_cache(models, ttl_hours, fetched_at, freshness, needs_review=None):
+    """Build the cache/pricing.json payload (FR-001, FR-006, FR-008).
+
+    `needs_review` is a top-level roll-up so a consumer can spot an entry a human
+    must look at without walking every model. `freshness` stays purely about age.
+    """
     return {
         "fetched_at": fetched_at,
         "ttl_hours": ttl_hours,
         "freshness": freshness,
+        "needs_review": sorted(needs_review or []),
         "models": models,
     }
 
 
+def _write_json_atomic(path, payload, **dump_kwargs):
+    """Write JSON via a temp file in the same directory, then rename.
+
+    Hermes, Pi and the estimator all read these files concurrently; a plain
+    truncate-and-write lets a reader observe a half-written file. os.replace is
+    atomic within a filesystem, so a reader sees either the old or the new file.
+    """
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, **dump_kwargs)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
 def emit(payload, out_path=CACHE_PATH):
     """Write a cache payload to out_path, creating parent directories."""
-    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
-    with open(out_path, "w", encoding="utf-8") as fh:
-        json.dump(payload, fh, indent=2, sort_keys=True)
+    _write_json_atomic(out_path, payload, indent=2, sort_keys=True)
+
+
+def _last_known_layer(discovery_path, layer_name):
+    """Return a previously fetched discovery layer, or None if unavailable."""
+    if not discovery_path:
+        return None
+    disc = _load_discovery(discovery_path)
+    return (disc or {}).get(layer_name) or None
 
 
 def _load_cache(path=CACHE_PATH):
@@ -319,40 +479,60 @@ def run(ttl_hours=DEFAULT_TTL_HOURS, force=False,
     # Cache-hit path (FR-002): fresh cache and not forced -> zero network I/O.
     if cache is not None and not force and is_fresh(cache, ttl_hours, now=now):
         print(f"cache fresh: served {len(cache.get('models', {}))} models")
+        # Recorded at write time; re-report it, or it stays silent for the whole
+        # TTL window and only the refreshing caller ever hears about it.
+        flagged = cache.get("needs_review") or []
+        if flagged:
+            print(f"warning: {len(flagged)} override(s) need review: "
+                  + ", ".join(sorted(flagged)), file=sys.stderr)
+            return 1
         return 0
 
     # Refresh path (FR-003): fetch both sources independently.
-    failed = False
+    #
+    # The two are not equally load-bearing. Slug resolution and price inheritance
+    # both read the OpenRouter catalog, so losing it means we cannot build a good
+    # cache and must fall back to stale. LiteLLM is a demoted fallback: reuse its
+    # last known layer rather than discarding an otherwise healthy refresh.
     try:
         openrouter_layer = fetch_openrouter(openrouter_url, openrouter_fetcher)
     except Exception:
         openrouter_layer = None
-        failed = True
     try:
         litellm_layer = fetch_litellm(litellm_url, litellm_fetcher)
     except Exception:
-        litellm_layer = None
-        failed = True
+        litellm_layer = _last_known_layer(discovery_path, "litellm")
+        reused = f"reusing {len(litellm_layer)} cached entries" if litellm_layer else "no cached layer"
+        print(f"warning: litellm unavailable; {reused}", file=sys.stderr)
+    catalog_unavailable = openrouter_layer is None
 
-    overrides = load_overrides(overrides_path)
+    overrides = attach_catalog_baseline(load_overrides(overrides_path),
+                                        openrouter_layer, litellm_layer, now=now)
     layers = [layer for layer in (openrouter_layer, litellm_layer, overrides) if layer]
     merged = merge(layers) if layers else {}
 
-    if not failed:
+    if not catalog_unavailable:
         valid = filter_valid(merged)
         if valid:
-            payload = build_cache(valid, ttl_hours, _now_iso(now), "fresh")
+            flagged = {mid: e["review"] for mid, e in valid.items() if e.get("review")}
+            payload = build_cache(valid, ttl_hours, _now_iso(now), "fresh", flagged)
             emit(payload, cache_path)
             if discovery_path:
                 _emit_discovery(discovery_path, _now_iso(now),
                                 openrouter_layer or {}, litellm_layer or {}, ttl_hours)
             print(f"fetched fresh: {len(valid)} models")
+            if flagged:
+                # Exit 1 ("served, but degraded") so a consumer that already
+                # handles the stale path cannot ignore a reviewable entry.
+                for mid in sorted(flagged):
+                    print(f"warning: {mid}: {flagged[mid]}", file=sys.stderr)
+                return 1
             return 0
         # Refresh succeeded but nothing survived validation -> hard failure.
         print("error: refresh produced no valid models", file=sys.stderr)
         return 2
 
-    # A source failed (FR-004/FR-005): serve stale if available, else fail.
+    # The catalog is unreachable (FR-004/FR-005): serve stale if available, else fail.
     stale_cache = cache if (isinstance(cache, dict) and cache.get("models")) else None
     if stale_cache is not None:
         stale_cache = dict(stale_cache)
@@ -377,8 +557,7 @@ def _emit_discovery(path, fetched_at, openrouter_layer, litellm_layer,
         "openrouter": openrouter_layer or {},
         "litellm": litellm_layer or {},
     }
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(payload, fh, sort_keys=True)
+    _write_json_atomic(path, payload, sort_keys=True)
 
 
 def _load_discovery(path=DISCOVERY_PATH):
@@ -428,9 +607,7 @@ def _endpoint_snapshot_path(slug, endpoints_dir=ENDPOINTS_CACHE_DIR):
 
 def _emit_endpoint_snapshot(path, payload):
     """Write an endpoint snapshot envelope."""
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(payload, fh, sort_keys=True)
+    _write_json_atomic(path, payload, sort_keys=True)
 
 
 def _load_endpoint_snapshot(path):
@@ -556,7 +733,7 @@ def query_main(args, openrouter_fetcher=_default_fetcher, litellm_fetcher=_defau
     offline = bool(getattr(args, "offline", False))
     action = args.action
     model = getattr(args, "model", None)
-    ttl_hours = DEFAULT_TTL_HOURS
+    ttl_hours = getattr(args, "ttl_hours", None) or DEFAULT_TTL_HOURS
 
     def _refresh_cache_if_stale(cache):
         if (cache is None or not is_fresh(cache, ttl_hours, now=now)) and not offline:
@@ -678,7 +855,8 @@ def main(argv=None):
     args = parse_args(argv)
     if getattr(args, "command", None) == "query":
         return query_main(args)
-    return run(ttl_hours=args.ttl_hours, force=args.force)
+    return run(ttl_hours=args.ttl_hours, force=args.force,
+               discovery_path=DISCOVERY_PATH)
 
 
 if __name__ == "__main__":
