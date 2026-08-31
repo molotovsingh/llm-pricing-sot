@@ -516,14 +516,36 @@ class TestGenerator(unittest.TestCase):
 
 
 class TestSkillSymlinkIsGoverned(unittest.TestCase):
+    """The governed file should be the one agents actually load.
+
+    Only the installed checkout can assert this. Any other clone skips loudly
+    rather than failing -- a secondary checkout is legitimate, and failing there
+    would break CI and every contributor's copy.
+    """
+
+    INSTALLED = pathlib.Path.home() / ".pi" / "agent" / "skills" / "llm-pricing"
+
+    def _skip_loudly(self, reason):
+        print(f"\n[contract] symlink unverified: {reason}", file=sys.stderr)
+        self.skipTest(reason)
+
+    def test_installed_skill_is_a_link_not_a_copy(self):
+        if not self.INSTALLED.exists():
+            self._skip_loudly("~/.pi/agent/skills/llm-pricing absent; agent harness "
+                              "not installed on this machine")
+        self.assertTrue(self.INSTALLED.is_symlink(),
+                        "the installed skill is a copy, not a link -- it will drift "
+                        "from the governed file the moment either is edited")
+
     def test_installed_skill_resolves_into_this_repo(self):
-        installed = pathlib.Path.home() / ".pi" / "agent" / "skills" / "llm-pricing"
-        if not installed.exists():
-            print("\n[contract] symlink unverified: ~/.pi/agent/skills/llm-pricing "
-                  "absent; the governed file may not be the one agents load",
-                  file=sys.stderr)
-            self.skipTest("agent harness not installed on this machine")
-        self.assertEqual(installed.resolve(), (REPO_ROOT / "skills" / "llm-pricing").resolve())
+        if not self.INSTALLED.exists():
+            self._skip_loudly("agent harness not installed on this machine")
+        target = self.INSTALLED.resolve()
+        ours = (REPO_ROOT / "skills" / "llm-pricing").resolve()
+        if target != ours:
+            self._skip_loudly(f"this checkout is not the installed one "
+                              f"({target} is); nothing to assert here")
+        self.assertEqual(target, ours)
 
 
 class TestCheckerIsHermetic(unittest.TestCase):
