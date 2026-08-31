@@ -2,8 +2,8 @@
 name: llm-pricing
 description: Get current LLM pricing (USD per 1M tokens) from the single source of truth at
   ~/llm/llm-pricing-sot. Use when you need a model's price, the cheapest provider host, the
-  model list, or pricing freshness; to refresh pricing data; or to judge whether prices are
-  authoritative (overrides) vs baseline (OpenRouter/LiteLLM discovery).
+  model list, or pricing freshness; to refresh pricing data; to work the review queue; or to
+  judge whether a price is tracked by the SOT or merely discovered baseline.
 ---
 
 # LLM Pricing
@@ -17,25 +17,51 @@ python ~/llm/llm-pricing-sot/fetch_pricing.py query price <model>
 python ~/llm/llm-pricing-sot/fetch_pricing.py query cheapest <model>
 python ~/llm/llm-pricing-sot/fetch_pricing.py query list
 python ~/llm/llm-pricing-sot/fetch_pricing.py query fresh
+python ~/llm/llm-pricing-sot/fetch_pricing.py query review   # entries a human must resolve
 ```
 
 Append `--offline` to any query to guarantee zero network (serves cached/stale data
-or reports "not found").
+or reports "not found"). Prefix `--ttl-hours N` to demand a tighter freshness window
+than the 24h default, e.g. `--ttl-hours 1 query price gpt-5.2`.
 
 ## Refresh (network)
 
 ```bash
-python ~/llm/llm-pricing-sot/fetch_pricing.py            # refresh when stale; unchanged pipeline command
+python ~/llm/llm-pricing-sot/fetch_pricing.py            # refresh when stale
 python ~/llm/llm-pricing-sot/fetch_pricing.py --force    # force a full refresh
 ```
 
-## Contract
+## Reading the answer
 
-- Answers are one JSON object on stdout; human notes on stderr.
-- Exit codes: `0` fresh, `1` stale, `2` no data / not found.
-- `"baseline": false` (usually `"source": "override"`) = what we actually pay — authoritative.
-- `"baseline": true` = discovery pricing from OpenRouter/LiteLLM — baseline only, NOT what we pay.
-- Prices are USD per 1M tokens.
+Prices are USD per 1M tokens. One JSON object on stdout; human notes on stderr.
+
+**Is this a price I can use?** Read `baseline`, not `source`:
+
+- **`"baseline": false`** — the model is tracked by the SOT. Use this price.
+  - `"source": "override"` — an *attested* rate we actually pay, deliberately
+    different from public pricing (a `note` says why). `drift` reports the gap.
+  - `"source": "openrouter"` / `"litellm"` — the live catalog price, refreshed
+    automatically. Equally usable; it just isn't a negotiated rate.
+- **`"baseline": true`** — not a tracked model; the answer came from raw discovery
+  data. Informational only. Do not treat it as what we pay.
+
+Most tracked models read `source: openrouter` by design — hand-typed prices are
+avoided because they rot. A `source` other than `override` does **not** mean the
+answer is unreliable.
+
+**Fields you may see:** `catalog` (the market row the price was checked against),
+`drift` (normalized gap from it), `review` (a human must look at this entry),
+`ranked_by` on `cheapest` (the input:output blend used to order providers).
+
+## Exit codes
+
+- `0` — clean, proceed.
+- `1` — **served but degraded**: a stale cache *or* a non-empty review queue.
+  The answer is usable; say it is degraded rather than presenting it as certain.
+  Run `query review` to see which entries and why.
+- `2` — no usable data / model not found. Treat as failure.
+
+Exit 1 is not only staleness. Do not report it as "stale data" without checking.
 
 ## Cost estimate for a call
 
