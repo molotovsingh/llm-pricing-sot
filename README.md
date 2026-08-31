@@ -87,7 +87,20 @@ fetch_pricing.py query price <model>            # authoritative price (override 
 fetch_pricing.py query cheapest <model>         # cheapest OpenRouter endpoint + authoritative override
 fetch_pricing.py query list                    # all models in cache
 fetch_pricing.py query fresh                   # freshness metadata
+fetch_pricing.py query review                  # the review queue; exit 1 while non-empty
 ```
+
+`query review` is the work list for `needs_review`. It shows the price you declared
+against the one now being served, so each row is a decision — attest the declared price,
+or delete `in`/`out` and keep inheriting:
+
+```
+model              you declared     now serving  reason
+gpt-5.2                 0.4/1.6       1.75/14.0  unattested-price-ignored
+gpt-5.6-sol            5.0/30.0        2.0/10.0  unattested-price-ignored
+```
+
+The table goes to stderr; stdout stays machine-readable JSON like every other query.
 
 `--ttl-hours` applies to queries too (`fetch_pricing.py --ttl-hours 1 query price <model>`),
 so a cost-critical run can demand a tighter freshness window than the 24h default.
@@ -182,7 +195,7 @@ Per-provider alternatives are **not** inlined into cache entries — they live i
 - ✅ `fetch_pricing.py` — fetch (OpenRouter models + `/endpoints`, LiteLLM), merge (attested overrides > OpenRouter catalog > LiteLLM), emit cache with freshness + review metadata, stale-fallback when the catalog is unreachable
 - ✅ `overrides.json` — seeded from `~/llm/llm-cost-estimator/data/pricing.json`; carries optional `openrouter_slug` where the short alias can't be resolved from the catalog
 - ✅ Attested-price enforcement — unattested hand-typed prices are discarded for the live catalog price; attestations expire after 90 days; anything reviewable degrades the exit code
-- ✅ Tests — 99 passing: merge precedence, TTL logic, stale-fallback, query surface, catalog linkage, attestation + review, atomic writes, cheapest ranking
+- ✅ Tests — 103 passing: merge precedence, TTL logic, stale-fallback, query surface, catalog linkage, attestation + review queue, atomic writes, cheapest ranking
 - ✅ Cache — `cache/pricing.json` + `discovery.json` + `endpoints/` emitting per the contract
 - 🔜 Consumer wiring — llm-cost-estimator integration via `LLM_PRICING_SOT_DIR` / `--pricing-dir` documented but not yet shipped in the estimator
 

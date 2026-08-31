@@ -1077,3 +1077,61 @@ class TestCheapestRanking(unittest.TestCase):
         a = {"provider_name": "a", "in": 1.0, "out": 2.0}
         b = {"provider_name": "b", "in": 1.0, "out": 2.0}
         self.assertEqual(min([a, b], key=_blended_cost)["provider_name"], "a")
+
+
+class TestQueryReview(unittest.TestCase):
+    """The review queue must show the discarded price, not just what is served."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.cache_path = os.path.join(self.dir.name, "pricing.json")
+        self.overrides_path = os.path.join(self.dir.name, "overrides.json")
+
+    def _review(self):
+        args = argparse.Namespace(action="review", model=None, offline=True, ttl_hours=24)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            code = query_main(args, cache_path=self.cache_path,
+                              overrides_path=self.overrides_path,
+                              discovery_path=os.path.join(self.dir.name, "d.json"))
+        return code, json.loads(buf.getvalue())
+
+    def _write(self, models, needs_review, overrides):
+        emit(build_cache(models, 24, _now_iso(), "fresh", needs_review), self.cache_path)
+        with open(self.overrides_path, "w", encoding="utf-8") as fh:
+            json.dump(overrides, fh)
+
+    def test_shows_declared_price_against_what_is_served(self):
+        self._write(
+            models={"m": {"in": 1.75, "out": 14.0, "tokenizer": "tok",
+                          "source": "openrouter", "review": "unattested-price-ignored",
+                          "catalog": {"slug": "x/m", "in": 1.75, "out": 14.0}}},
+            needs_review=["m"],
+            overrides={"m": {"tokenizer": "tok", "in": 0.4, "out": 1.6}})
+        code, data = self._review()
+        self.assertEqual(code, 1)
+        row = data["needs_review"][0]
+        self.assertEqual((row["declared_in"], row["declared_out"]), (0.4, 1.6))
+        self.assertEqual((row["serving_in"], row["serving_out"]), (1.75, 14.0))
+        self.assertEqual(row["reason"], "unattested-price-ignored")
+
+    def test_dropped_entry_reason_is_inferred(self):
+        # Absent from models, so no entry carries the reason.
+        self._write(models={"ok": {"in": 1.0, "out": 2.0, "tokenizer": "tok"}},
+                    needs_review=["gone"],
+                    overrides={"gone": {"tokenizer": "tok", "openrouter_slug": "x/gone"}})
+        _, data = self._review()
+        self.assertEqual(data["needs_review"][0]["reason"], "dropped-unpriceable")
+        self.assertIsNone(data["needs_review"][0]["serving_in"])
+
+    def test_empty_queue_exits_0(self):
+        self._write(models={"m": {"in": 1.0, "out": 2.0, "tokenizer": "tok"}},
+                    needs_review=[], overrides={})
+        code, data = self._review()
+        self.assertEqual(code, 0)
+        self.assertEqual(data["needs_review"], [])
+
+    def test_no_cache_exits_2(self):
+        code, _ = self._review()
+        self.assertEqual(code, 2)

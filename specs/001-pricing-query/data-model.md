@@ -87,6 +87,11 @@ input price alone would let a host with cheap input and expensive output win.
 
 `fresh`: `{"freshness": "fresh"|"stale"|"no-data", "fetched_at": ..., "ttl_hours": 24}`
 
+`review`: `{"freshness": ..., "needs_review": [{"model", "reason", "declared_in",
+"declared_out", "serving_in", "serving_out", "serving_source", "slug"}, ...]}`.
+Exit 1 while the queue is non-empty. `declared_*` comes from `overrides.json` (the
+price that was discarded); `serving_*` is what the cache actually returns.
+
 ## State Transitions
 
 - Query with fresh cache → answer from cache (exit 0), zero network.

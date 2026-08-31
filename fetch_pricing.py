@@ -70,7 +70,8 @@ def parse_args(argv=None):
     )
     sub = parser.add_subparsers(dest="command")
     q = sub.add_parser("query", help="run pricing queries (price, cheapest, list, fresh)")
-    q.add_argument("action", choices=["price", "cheapest", "list", "fresh"], help="query action")
+    q.add_argument("action", choices=["price", "cheapest", "list", "fresh", "review"],
+                   help="query action")
     q.add_argument("model", nargs="?", default=None, help="model id (for price/cheapest)")
     q.add_argument(
         "--offline",
@@ -781,6 +782,36 @@ def query_main(args, openrouter_fetcher=_default_fetcher, litellm_fetcher=_defau
         fetched_at = cache.get("fetched_at") if isinstance(cache, dict) else None
         return _out({"freshness": freshness, "fetched_at": fetched_at,
                      "ttl_hours": ttl_hours}, freshness)
+
+    if action == "review":
+        if cache is None:
+            return _out({"needs_review": [], "freshness": freshness}, "no-data")
+        declared = load_overrides(overrides_path)
+        rows = []
+        for mid in cache.get("needs_review") or []:
+            entry = cache_models.get(mid) or {}
+            own = declared.get(mid) or {}
+            # An id in needs_review but absent from models can only have been
+            # dropped: nothing could price it, so no entry carries the reason.
+            rows.append({"model": mid,
+                         "reason": entry.get("review", "dropped-unpriceable"),
+                         "declared_in": own.get("in"), "declared_out": own.get("out"),
+                         "serving_in": entry.get("in"), "serving_out": entry.get("out"),
+                         "serving_source": entry.get("source"),
+                         "slug": (entry.get("catalog") or {}).get("slug")})
+        if rows:
+            def _pair(a, b):
+                return f"{a}/{b}" if a is not None else "—"
+            width = max(len(r["model"]) for r in rows)
+            print(f"{'model'.ljust(width)}  {'you declared':>14}  {'now serving':>14}  reason",
+                  file=sys.stderr)
+            for r in rows:
+                print(f"{r['model'].ljust(width)}  "
+                      f"{_pair(r['declared_in'], r['declared_out']):>14}  "
+                      f"{_pair(r['serving_in'], r['serving_out']):>14}  {r['reason']}",
+                      file=sys.stderr)
+        return _out({"needs_review": rows, "freshness": freshness},
+                    "stale" if rows else freshness)
 
     disc = ensure_discovery(offline, ttl_hours, now,
                             openrouter_fetcher, litellm_fetcher, discovery_path)
