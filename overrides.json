@@ -5,7 +5,7 @@
                       "openrouter_slug": "z-ai/glm-5.2",
                       "in": 0.46, "out": 1.45,
                       "negotiated": true,
-                      "note": "z.ai GLM Coding Plan direct rate; OpenRouter lists the public API price.",
+                      "note": "z.ai direct rate under a paid plan; OpenRouter lists the public API price.",
                       "verified_at": "2026-08-16"},
 
   "gpt-5.6-sol":     {"tokenizer": "tiktoken:o200k_base", "openrouter_slug": "openai/gpt-5.6-sol",
