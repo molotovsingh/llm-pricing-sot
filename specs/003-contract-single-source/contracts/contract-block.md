@@ -18,6 +18,21 @@ on success — a maintainer never invokes it directly, they just run the suite.
 - At most one block per fact id per document.
 - Everything outside the markers is free prose and is never inspected.
 
+### What counts as a real block
+
+A marker is a real block only when **all three** hold (`research.md` §R5):
+
+1. it starts at **column 0** — excludes inline mentions inside backticks;
+2. it is **outside any fenced code block** — excludes syntax examples like the one above;
+3. its fact id is **known** — excludes the `<fact-id>` placeholder.
+
+Without these rules the unregistered-marker guard fails on this very document. Note that the
+example above is itself excluded by rules 1–3, which is the intended behaviour and the
+cheapest available test of them.
+
+Rule 3 governs *recognition* only. Once a block is recognised, an unknown fact id inside it
+is still a hard error — see the behaviour table.
+
 ## The facts
 
 ### `exit-codes`
@@ -57,6 +72,20 @@ Verified operationally, not textually: for every model in the emitted cache, the
 above MUST reach the same usability decision as the `degraded` flag returned by
 `query price`. This catches a wrong rule; it does not catch a confusingly-worded one.
 
+## Generator behaviour
+
+The writer rewrites canonical blocks in place, so a contract change costs one hand-edited
+file (`research.md` §R2, SC-001).
+
+| Aspect | Behaviour |
+|---|---|
+| Scope of writes | **Only** the text between markers, in registered live documents |
+| Prose outside markers | Never read, never written |
+| Missing block in a live document | Reported, not silently inserted — placement is an editorial choice |
+| Unregistered file | Never written |
+| Idempotence | Running twice with no code change produces no diff |
+| Invocation | On demand only; never as part of the test run, so the gate cannot self-heal and hide drift |
+
 ## Checker behaviour
 
 | Condition | Result |
@@ -65,8 +94,9 @@ above MUST reach the same usability decision as the `degraded` flag returned by
 | A block's body differs from canonical | **fail** — names path, fact id, and prints the correct block verbatim |
 | A required block is missing from a live document | **fail** — deleting a block must not be a way to opt out |
 | A registered live document does not exist on disk | **fail** — a rename must not silently drop coverage |
-| A block appears in a file not in the registry | **fail** — catches copy-paste into a new document |
-| An unknown `<fact-id>` appears in any block | **fail** — a typo must not silently disable a check |
+| A *real* block appears in a file not in the registry | **fail** — catches copy-paste into a new document |
+| A marker appears indented, inside a code fence, or with an unknown id | ignored — not a real block (see above) |
+| An unknown `<fact-id>` appears inside a recognised block | **fail** — a typo must not silently disable a check |
 | A historical document states a superseded rule | pass — exemption is explicit and intended |
 
 Comparison normalises line endings and trailing whitespace only. There is no semantic
@@ -78,7 +108,8 @@ tolerance: a reworded block is a failure, because the block is the normative sta
 - **No new dependency, no build step** (Principle I).
 - **Runs in the default suite**, so coverage is automatic rather than remembered
   (Development Workflow).
-- **Failure output is the fix**: the printed canonical block is pasted between the markers.
+- **Failure output is the fix**: the printed canonical block is pasted between the markers,
+  or the generator is run to write every block at once.
 
 ## Non-guarantees
 

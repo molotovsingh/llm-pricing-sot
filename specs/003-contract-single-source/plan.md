@@ -8,13 +8,19 @@
 Three normative facts — exit-code meanings, cache envelope schema, and the trust rule —
 are restated across ten locations with no authoritative source, so a behaviour change
 silently leaves some readers wrong. The approach: **derive the facts from the running code**,
-embed them as a marked, machine-comparable block in each governed document, and **assert
-agreement in the existing test suite** rather than generating documents. Prose stays
-hand-written; only the marked blocks are governed. A failure names the file and prints the
-correct block, so fixing drift is mechanical.
+embed them as a marked block in each governed document, **assert agreement in the existing
+test suite** (the gate), and **write the blocks on demand with a stdlib generator** (the
+remedy). Prose outside the markers stays hand-written and is never touched.
 
-Anchoring to code rather than to a canonical document is the load-bearing choice: it also
-catches the case where every document agrees with each other and all of them are wrong.
+Two load-bearing choices:
+
+- **Anchor to code, not to a canonical document.** This also catches the case where every
+  document agrees with every other and all of them are wrong — a failure this repo has
+  already had.
+- **Gate *and* generator, not one or the other.** Assertion alone leaves the N-file chase
+  intact (merely guided), which made SC-001 unachievable; generation alone leaves drift
+  silent until someone chooses to run the writer. See `research.md` §R2, revised after
+  `/speckit-analyze` finding F3.
 
 ## Technical Context
 
@@ -79,14 +85,16 @@ tests/
 README.md
 skills/llm-pricing/SKILL.md
 .specify/memory/constitution.md
-.specify/templates/plan-template.md
 specs/001-pricing-query/contracts/query-cli.md
 specs/001-pricing-query/quickstart.md
 specs/002-pricing-endpoints/contracts/cheapest-query.md
 
-# Explicitly exempt (historical records — must NOT be updated)
-specs/001-pricing-query/research.md
-specs/00*/spec.md
+# Restatement REMOVED rather than governed (references the constitution instead)
+.specify/templates/plan-template.md
+
+# Exempt by declared path rule (historical records — must NOT be updated)
+specs/*/research.md
+specs/*/spec.md
 ```
 
 **Structure Decision**: No new package or module layout. The checker lives beside the
@@ -98,8 +106,14 @@ already mandates — no new command for a maintainer to remember, and CI coverag
 
 > No constitution violations. Table intentionally empty.
 
-The one judgment worth recording is a deliberate *non*-choice: generating documents from a
-template engine was rejected (see `research.md` §R2) because it would add a build step to a
-repo whose stated property is clone-and-run, and would make hand-written prose partly
-machine-owned for a benefit — preventing rather than detecting drift — that the assert
-approach substantially delivers at a fraction of the cost.
+One judgment is worth recording because it was **reversed** during analysis. Generation was
+initially rejected on the grounds that it "would add a build step", contradicting the repo's
+clone-and-run property. That premise did not survive checking: constitution Principle I
+forbids third-party dependencies and an install step, and a stdlib writer invoked on demand
+adds neither — it is the same kind of artifact as `fetch_pricing.py`, which already writes
+files. The rejection had been paying for a constraint that does not apply, at the cost of an
+unachievable SC-001. The surviving objection — partly machine-owned documents — is real but
+bounded by the block design: ownership stops at the markers, which is exactly the scope the
+feature governs.
+
+A third-party template engine remains rejected, for the reason originally given.

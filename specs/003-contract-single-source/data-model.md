@@ -72,16 +72,22 @@ Registry at feature start:
 | `skills/llm-pricing/SKILL.md` | live | `exit-codes`, `trust-rule` |
 | `README.md` | live | `exit-codes`, `envelope`, `trust-rule` |
 | `.specify/memory/constitution.md` | live | `exit-codes`, `envelope` |
-| `.specify/templates/plan-template.md` | live | *(gate text only — see `research.md` §R4)* |
 | `specs/001-pricing-query/contracts/query-cli.md` | live | `exit-codes` |
 | `specs/001-pricing-query/quickstart.md` | live | `exit-codes`, `trust-rule` |
 | `specs/002-pricing-endpoints/contracts/cheapest-query.md` | live | `exit-codes` |
-| `specs/001-pricing-query/research.md` | historical | — (exempt) |
-| `specs/00*/spec.md` | historical | — (exempt) |
+| `specs/*/research.md` | historical | — (exempt by declared path rule) |
+| `specs/*/spec.md` | historical | — (exempt by declared path rule) |
 
-**Exemption is explicit, never inferred** (FR-006): a document is historical because it is
-listed as such, not because it looks old. A genuinely stale live document therefore cannot
-hide by resembling a record.
+`.specify/templates/plan-template.md` is deliberately **not** governed: its Constitution
+Check references the constitution's principles rather than restating them, so it carries no
+normative statement to govern (`research.md` §R4). Removing a restatement is preferable to
+governing one.
+
+**Exemption is by declared rule, never inferred from content** (FR-006): a document is
+historical because a registry rule says so, not because it reads like a record. The two
+path rules above are declared here and cover future features automatically — which is
+intended, since every `specs/N-*/spec.md` is a point-in-time record by construction. A
+genuinely stale *live* document cannot hide, because no rule matches it.
 
 ---
 

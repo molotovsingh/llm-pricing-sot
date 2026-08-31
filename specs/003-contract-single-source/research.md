@@ -45,31 +45,45 @@ rule confusingly and still pass. The check catches wrongness, not unclarity.
 
 ## R2 — Generate the blocks, or assert them? (resolves FR-010)
 
-**Decision**: **Assert.** The checker compares each governed document's marked block against
-the derived facts and fails with the correct block printed in the failure message.
-Documents are never written by tooling.
+> **Revised after `/speckit-analyze` finding F3.** The first decision was *assert only*.
+> Analysis showed that choice made SC-001 unachievable — SC-001 requires a rule change to
+> cost one hand-edited file, while assert-only costs one code edit plus a manual paste into
+> every governed document. Re-examining the rejection also showed its main premise was
+> wrong: see below. Recorded rather than silently amended, because the reasoning is the
+> useful part.
 
-**Rationale**: Generation would require a build step, which contradicts the repo's stated
-clone-and-run property (constitution Principle I) and would make hand-written prose partly
-machine-owned. Assertion runs inside the existing `python -m unittest discover -s tests`
-invocation that the constitution's Development Workflow already mandates, so it is not a new
-discipline anyone has to remember. Because the failure message contains the exact correct
-block, fixing drift is a copy-paste — most of generation's benefit at a fraction of its cost.
+**Decision**: **Both, with distinct roles.** Assertion is the *gate*: the test suite fails
+on any drift. Generation is the *remedy*: an on-demand stdlib writer rewrites the canonical
+blocks in place. Documents are machine-written **only between the markers**; all prose
+outside them remains hand-written and untouched.
 
-**Residual risk, accepted**: assertion detects drift rather than preventing it, so a
-document is briefly wrong between the code edit and the test run. Bounded by the workflow
-rule that the suite runs before work is marked done.
+**Rationale**: The original rejection rested on "generation would require a build step,
+which contradicts clone-and-run." That premise does not survive checking. Constitution
+Principle I forbids *third-party dependencies* and an *install step*; a stdlib writer
+invoked on demand adds neither — it is the same kind of artifact as `fetch_pricing.py`
+itself, which already writes files. No build step is introduced because nothing must run
+before the repo works; the writer is only used when a contract rule changes.
+
+The surviving objection — that documents become partly machine-owned — is real but already
+bounded by the block design: ownership stops at the markers, which is precisely the scope
+the feature intends to govern. Paying for that with an unachievable success criterion was
+the wrong trade.
+
+Keeping assertion as the gate matters independently: generation alone would leave a document
+wrong until someone remembered to run the writer, whereas the suite fails on every run.
+
+**Residual risk, accepted**: a maintainer can still edit inside the markers by hand and be
+briefly out of step until the next suite run. Bounded by the Development Workflow rule that
+the suite runs before work is marked done.
 
 **Alternatives considered**:
 
-- *Generate blocks into documents* — rejected for the build-step and ownership reasons
-  above. Reconsider if the governed set grows well beyond ~10 documents, where copy-paste
-  fixing stops being cheap.
+- *Assert only* — rejected on re-analysis: leaves SC-001 unachievable and the N-file chase
+  intact, merely guided.
+- *Generate only, no gate* — rejected: drift would persist silently until someone chose to
+  run the writer, which is the status-quo failure mode with an extra step.
 - *Manual discipline* — rejected. This is the status quo, and it failed four times in one
   session (`e807849`, `234dc5f`, `9ce70bc`, `92c3d52`).
-- *A `--fix` mode that rewrites blocks on request* — deferred, not rejected. It is a small
-  addition to the assert design and can be added if copy-paste proves annoying; building it
-  now would be speculative.
 
 ---
 
@@ -118,11 +132,45 @@ wrong rule, and the fix is one line.
 
 ---
 
+## R5 — What counts as a real marker? (raised by `/speckit-analyze` finding F1)
+
+**Problem**: The unregistered-marker guard from R3 fails on any `contract:begin` found in an
+unregistered file. But this feature's own documents contain that literal four times —
+`contracts/contract-block.md:11` and `data-model.md:37` show the syntax inside fenced code
+blocks, and `tasks.md` mentions it inline twice. As first specified, the guard would fail on
+the documentation that defines it. It was unimplementable.
+
+**Decision**: A marker counts as a **real block** only when all three hold:
+
+1. it begins at **column 0** (excludes inline mentions inside backticks in prose);
+2. it is **not inside a fenced code block** (excludes syntax examples);
+3. its **fact id is known** — one of `exit-codes`, `envelope`, `trust-rule` (excludes the
+   `<fact-id>` placeholder used in examples).
+
+All four existing occurrences are excluded by rules 1–2, and the two in code fences are
+excluded twice over. Documentation can therefore show the syntax without special-casing.
+
+**Rationale**: Each rule is mechanical and needs no heuristics. Rule 3 also preserves the
+separate guarantee that an unknown fact id is an *error* rather than a skip — that check
+applies to blocks that already passed rules 1–2, so a typo inside a real block still fails
+loudly while a placeholder in an example does not.
+
+**Alternatives considered**:
+
+- *Exclude `specs/003-*/**` from the walk* — rejected: weakens FR-008 permanently to fix a
+  presentation problem, and any future document explaining the syntax would need the same
+  exemption.
+- *Escape the markers in documentation* (e.g. zero-width characters) — rejected: makes the
+  syntax uncopyable, which defeats the purpose of documenting it.
+
+---
+
 ## Consolidated decisions
 
 | # | Question | Decision | Reversibility |
 |---|---|---|---|
-| R1 | Source of truth | The running code, via derivation | Low cost to change — the checker's fact-extraction layer is isolated |
-| R2 | Generate vs assert | Assert, failure prints the correct block | Low — generation could be layered on later as `--fix` |
+| R1 | Authoritative statement | The running code, via derivation | Low cost to change — the checker's fact-extraction layer is isolated |
+| R2 | Generate vs assert | **Both**: assert as the gate, on-demand stdlib writer as the remedy (revised — see F3) | Low — the writer is additive to the gate |
 | R3 | Governed-file discovery | Explicit registry + unregistered-marker guard | Trivial — registry is a list |
-| R4 | Stale plan-template gate | Fix and govern it | Trivial |
+| R4 | Stale plan-template gate | Reference the constitution instead of restating it | Trivial |
+| R5 | Marker recognition | Column 0 + outside code fences + known fact id | Trivial — three predicates |

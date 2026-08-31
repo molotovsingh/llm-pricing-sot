@@ -98,7 +98,7 @@ at decision time. Worth doing once the mechanism from Stories 1–2 exists.
   point-in-time decision records; rewriting them destroys the history spec-kit exists to
   keep. `research.md:51` already carries an explicit supersession note — the mechanism must
   treat that as correct, not as drift.
-- **The source of truth can itself be wrong.** Single-sourcing removes disagreement between
+- **The authoritative statement can itself be wrong.** Single-sourcing removes disagreement between
   documents; it does not prove any of them match the code. A statement that drifts from
   `fetch_pricing.py` while all documents agree is still undetected unless the source is
   anchored to observable behaviour.
@@ -117,31 +117,34 @@ at decision time. Worth doing once the mechanism from Stories 1–2 exists.
 
 - **FR-001**: The system MUST have exactly one authoritative statement of each normative
   contract element — exit-code meanings, cache envelope schema, and the trust rule.
-- **FR-002**: The agent-facing skill's normative statements MUST be derived from, or
-  verified against, that authoritative statement — never maintained independently.
+- **FR-002**: The agent-facing skill's normative statements MUST be **written by the
+  generator and verified by the gate** against that authoritative statement — never
+  maintained independently (`research.md` §R2).
 - **FR-003**: The system MUST detect and report when a live document's normative statement
   disagrees with the authoritative one, naming the file and the specific statement.
 - **FR-004**: The check MUST run as part of the default test suite and MUST NOT access the
   network (constitution Principle V).
 - **FR-005**: The system MUST NOT introduce a third-party dependency or a build step
   (constitution Principle I: stdlib-only, clone-and-run).
-- **FR-006**: Historical spec artifacts MUST be exempt, and the exemption MUST be explicit
-  per document rather than inferred, so a genuinely stale live document cannot hide by
-  looking historical.
+- **FR-006**: Historical spec artifacts MUST be exempt by a **declared rule**, never by
+  inference from a document's content or apparent age, so a genuinely stale live document
+  cannot hide by looking historical. A path rule (e.g. `specs/*/research.md`) satisfies
+  this; "it reads like a record" does not.
 - **FR-007**: Prose and examples MUST remain hand-written; only normative statements are
   governed.
 - **FR-008**: Adding a new document that restates the contract MUST NOT silently escape the
-  check. [NEEDS CLARIFICATION: is an allow-list of governed files acceptable, or must
-  unregistered restatements be discovered automatically? The latter needs a way to
-  recognise a contract statement in arbitrary prose.]
-- **FR-009**: [NEEDS CLARIFICATION: where does the authoritative statement live — the
-  constitution (already declared canonical for exit codes in Principle III), a dedicated
-  contract document, or the implementation itself? Anchoring to the implementation would
-  also address the "source can be wrong" edge case; anchoring to a document would not.]
-- **FR-010**: [NEEDS CLARIFICATION: generate the normative blocks into documents, or assert
-  agreement and fail? Generation prevents drift but makes documents partly machine-owned;
-  assertion is cheaper and keeps documents hand-written but permits a broken window until
-  someone runs the check.]
+  check. Resolved (`research.md` §R3): an explicit registry of governed documents, hardened
+  by failing when a real contract block appears in an unregistered file. A **real** block is
+  one at column 0, outside any fenced code block, bearing a known fact id (`research.md`
+  §R5) — so documentation may show the syntax without tripping the guard.
+- **FR-009**: The authoritative statement MUST be **derived from the running code**, not
+  held in any document. Resolved (`research.md` §R1): a document source cannot detect the
+  case where every document agrees and all are wrong — a failure this repo has already had,
+  when the constitution claimed canonical status for exit codes while being stale itself.
+- **FR-010**: The system MUST both **assert** agreement (a gate that fails on drift in the
+  default suite) and **generate** the canonical blocks on demand (a stdlib writer that
+  rewrites them in place). Resolved (`research.md` §R2, revised): assertion alone leaves
+  SC-001 unachievable; generation alone leaves drift silent until someone runs the writer.
 
 ### Key Entities
 
@@ -152,15 +155,18 @@ at decision time. Worth doing once the mechanism from Stories 1–2 exists.
   `.specify/memory/constitution.md`, and the `specs/*/contracts/` and `quickstart.md` files.
 - **Historical artifact**: A point-in-time record whose value is that it does *not* change.
   Today: `specs/*/research.md` and `specs/*/spec.md`.
-- **Contract source**: The single authoritative origin of each normative statement.
+- **Authoritative statement**: The single origin of each normative fact. Derived from the
+  running code, never held in a document (`research.md` §R1). Used consistently under this
+  name across spec, plan, research and data-model.
 
 ## Success Criteria *(mandatory)*
 
 ### Measurable Outcomes
 
-- **SC-001**: Changing a normative contract rule requires editing **one** file; no live
-  document needs a manual follow-up edit. Baseline: the last two contract changes each took
-  four commits across seven document-edits.
+- **SC-001**: Changing a normative contract rule requires **one hand-edited file** (the
+  code) plus running the generator; no live document is edited by hand and none is left
+  disagreeing. Baseline: the last two contract changes each took four commits across seven
+  hand-edited documents.
 - **SC-002**: A deliberately desynced live document is reported by the default test suite in
   a single run, naming the file — verified by desyncing each governed document in turn.
 - **SC-003**: At any commit, **zero** live documents disagree with shipped behaviour on exit

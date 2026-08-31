@@ -23,10 +23,21 @@ Phase 1. What a maintainer or agent does once this feature ships.
      ...
    ```
 
-4. Paste each printed block between that document's markers. Re-run. Green.
+4. Run the generator to write every block at once:
 
-You never hand-derive the new wording, and you cannot miss a document — the failure
-enumerates them.
+   ```bash
+   python tests/test_contract_drift.py --fix
+   ```
+
+5. Re-run the suite. Green.
+
+One hand-edited file (the code); no document edited by hand; none left disagreeing. For a
+single-document change you can paste the printed block instead — the failure message
+contains it verbatim.
+
+The generator writes **only** between markers. Prose outside them is never touched, and it
+never runs as part of the test run — a gate that could silently repair itself would hide the
+drift it exists to report.
 
 ## Adding a governed document
 
