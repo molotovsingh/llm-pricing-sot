@@ -22,9 +22,9 @@ This project uses an opinionated local tooling layer to generate the artifacts t
 
 ## The pipeline contract is single-sourced
 
-Three normative facts — exit-code meanings, the cache envelope schema, and the trust rule —
-are **derived from `fetch_pricing.py`** and compared against a marked block in each governed
-document. Before this, the same rules were restated in ten places and drifted silently; one
+Four normative facts — exit-code meanings, the cache envelope schema, the trust rule, and the
+unit vocabulary — are **derived from `fetch_pricing.py`** and compared against a marked block
+in each governed document. Before this, the same rules were restated in ten places and drifted silently; one
 stale copy told agents that `source: override` meant authoritative after that became true
 for one model in nine.
 

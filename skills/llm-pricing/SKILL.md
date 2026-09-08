@@ -1,9 +1,11 @@
 ---
 name: llm-pricing
-description: Get current LLM pricing (USD per 1M tokens) from the single source of truth at
-  ~/llm/llm-pricing-sot. Use when you need a model's price, the cheapest provider host, the
-  model list, or pricing freshness; to refresh pricing data; to work the review queue; or to
-  judge whether a price is tracked by the SOT or merely discovered baseline.
+description: Get current LLM pricing from the single source of truth at ~/llm/llm-pricing-sot.
+  Use when you need a model's price, its price at a specific host (Together, Baseten, ...),
+  every host that serves it, the cheapest host, what we actually run (deployments, including
+  self-hosted models priced per page), the model list, or pricing freshness; to refresh
+  pricing data; to work the review queue; or to judge whether a price is tracked truth or
+  merely discovered baseline. Every price names its unit.
 ---
 
 # LLM Pricing
@@ -18,11 +20,32 @@ python ~/llm/llm-pricing-sot/fetch_pricing.py query cheapest <model>
 python ~/llm/llm-pricing-sot/fetch_pricing.py query list
 python ~/llm/llm-pricing-sot/fetch_pricing.py query fresh
 python ~/llm/llm-pricing-sot/fetch_pricing.py query review   # entries a human must resolve
+python ~/llm/llm-pricing-sot/fetch_pricing.py query hosts <model>            # every host serving it, cheapest first
+python ~/llm/llm-pricing-sot/fetch_pricing.py query price <model> --host <h> # the price AT that host
+python ~/llm/llm-pricing-sot/fetch_pricing.py query cheapest <model> --host <h>
+python ~/llm/llm-pricing-sot/fetch_pricing.py query deployments              # what we actually run
 ```
 
 Append `--offline` to any query to guarantee zero network (serves cached/stale data
 or reports "not found"). Prefix `--ttl-hours N` to demand a tighter freshness window
 than the 7-day default, e.g. `--ttl-hours 1 query price gpt-5.2`.
+
+## Price at a host, and what we actually run
+
+**Ask for the host, not the cheapest.** `cheapest` answers "who is cheapest"; a workload
+already placed at Together costs Together's price. `query price <model> --host together`
+returns a recorded deployment there if one exists (`source: deployment`, `baseline: false` —
+use it), else the catalog's price at that host (`baseline: true`), else `found: false`
+with exit 2. Host names are canonical (`together`, `baseten`, `fireworks`, `zai`,
+`deepinfra`, `novita`, `moonshot`, `self-host`); case and punctuation do not matter.
+
+`query hosts <model>` is the depth view: every `(host, sku)` from both catalogs
+(`source: openrouter-endpoints` or `hf-router`), cheapest first, plus any deployments. A
+host listed without `in`/`out` is flat-rate (Featherless) — never rank it per token.
+
+`query deployments` lists what we actually run, each in its **native unit**. A
+self-hosted entry is priced `per_page` from a GPU rate and a benchmark measurement, and
+`rate` names which rate was used. Read `unit` before doing arithmetic.
 
 ## Refresh (network)
 
@@ -63,9 +86,11 @@ An `override` is deliberately different from public pricing (a `note` says why) 
 hand-typed prices are avoided because they rot. A `source` other than `override`
 does **not** mean the answer is unreliable.
 
-**Fields you may see:** `catalog` (the market row the price was checked against),
-`drift` (normalized gap from it), `review` (a human must look at this entry),
-`ranked_by` on `cheapest` (the input:output blend used to order providers).
+**Fields you may see:** `unit` (what one unit of the price buys — always present),
+`catalog` (the market row the price was checked against), `drift` (normalized gap from
+it), `review` (a human must look at this entry), `ranked_by` on `cheapest` (the
+input:output blend used to order providers), `host` (on per-host answers),
+`attestation` and `rate` (on deployments).
 
 ## Exit codes
 

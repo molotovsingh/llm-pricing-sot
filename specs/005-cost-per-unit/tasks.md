@@ -16,21 +16,21 @@ ends green and committed.
 **Goal**: every price carries a unit; the envelope gains `deployments`; nothing that
 worked yesterday changes.
 
-- [ ] T001 [US1] Add `UNITS` to `fetch_pricing.py`: ordered mapping unit → price fields,
+- [x] T001 [US1] Add `UNITS` to `fetch_pricing.py`: ordered mapping unit → price fields,
       with a docstring stating the vocabulary is governed.
-- [ ] T002 [US1] `validate_entry`: require `unit` (default `per_1m_tokens` for legacy
+- [x] T002 [US1] `validate_entry`: require `unit` (default `per_1m_tokens` for legacy
       entries), validate per unit, reject unknown units and foreign price fields.
-- [ ] T003 [US1] Stamp `unit: "per_1m_tokens"` on every merged model entry in `run()`
+- [x] T003 [US1] Stamp `unit: "per_1m_tokens"` on every merged model entry in `run()`
       before validation; `build_cache` gains `deployments=None` → `{}`.
-- [ ] T004 [P] [US1] Tests: `TestUnits` — vocabulary shape, per-unit validation,
+- [x] T004 [P] [US1] Tests: `TestUnits` — vocabulary shape, per-unit validation,
       unknown unit rejected, legacy entry defaults, envelope key present and empty.
-- [ ] T005 [US1] `tests/test_contract_drift.py`: `render_units()` from `UNITS`; register
+- [x] T005 [US1] `tests/test_contract_drift.py`: `render_units()` from `UNITS`; register
       `units` in `FACTS`; add to `GOVERNED` for `README.md`, `SKILL.md`, constitution,
       and the 005 contract; `derive_envelope` picks up `deployments` unchanged.
-- [ ] T006 [US1] Amend `.specify/memory/constitution.md` → 3.0.0 with Sync Impact Report:
+- [x] T006 [US1] Amend `.specify/memory/constitution.md` → 3.0.0 with Sync Impact Report:
       Principle II (two-file truth layer), Principle IV (HF demoted), Data constraints
       (unit vocabulary via governed block replaces "MUST be USD per 1M tokens").
-- [ ] T007 [US1] Insert `units` marker blocks in the governed docs; run
+- [x] T007 [US1] Insert `units` marker blocks in the governed docs; run
       `python tests/test_contract_drift.py --fix`; suite green.
 
 **Checkpoint**: cache regenerated; every `models[*]` has `unit`; estimator still runs.
@@ -40,30 +40,30 @@ worked yesterday changes.
 **Goal**: what the user actually runs is the truth, in its native unit, attested,
 derived where self-hosted, cross-checked where a catalog exists.
 
-- [ ] T008 [US2] `load_deployments(path)` and `load_gpu_rates(path)` mirroring
+- [x] T008 [US2] `load_deployments(path)` and `load_gpu_rates(path)` mirroring
       `load_overrides` (underscore keys are docs; missing/corrupt → `{}`).
-- [ ] T009 [US2] `validate_deployment(entry)` per data-model.md; `deployment_attestation_state`
+- [x] T009 [US2] `validate_deployment(entry)` per data-model.md; `deployment_attestation_state`
       (note + parseable verified_at; expiry via `ATTESTATION_MAX_AGE_DAYS`).
-- [ ] T010 [US2] `derive_deployment_price(entry, gpu_rates, now)` →
+- [x] T010 [US2] `derive_deployment_price(entry, gpu_rates, now)` →
       `usd_per_hour × seconds_per_unit / 3600`, attaching `rate`; reasons
       `gpu-rate-missing`, `gpu-rate-expired`, `bench-missing`.
-- [ ] T011 [US2] `resolve_deployments(deployments, gpu_rates, host_rows_for, now)` →
+- [x] T011 [US2] `resolve_deployments(deployments, gpu_rates, host_rows_for, now)` →
       emitted dict: quoted vs derived, attestation, `unattested-deployment` rule
       (catalog at host replaces; else keep), `catalog` + `drift` for per-token quoted
       entries at a catalog host.
-- [ ] T012 [US2] Wire into `run()`: deployments resolved every refresh, emitted under
+- [x] T012 [US2] Wire into `run()`: deployments resolved every refresh, emitted under
       `deployments`, ids rolled into `needs_review`, warnings to stderr, exit 1 when
       flagged (cache-hit path re-reports, as for models).
-- [ ] T013 [US2] `_query_deployments(ctx)` + `parse_args` choice `deployments`; stderr
+- [x] T013 [US2] `_query_deployments(ctx)` + `parse_args` choice `deployments`; stderr
       table via `_print_review_table`-style helper.
-- [ ] T014 [P] [US2] Seed `gpu_rates.json` from research.md §R5 (RunPod Secure Cloud,
+- [x] T014 [P] [US2] Seed `gpu_rates.json` from research.md §R5 (RunPod Secure Cloud,
       Modal), each with note + `verified_at: 2026-09-08`.
-- [ ] T015 [P] [US2] Seed `deployments.json`: quoted `kimi-k3@together`,
+- [x] T015 [P] [US2] Seed `deployments.json`: quoted `kimi-k3@together`,
       `glm-5.2@together`, `glm-5.2@baseten`, `deepseek-v4-pro-0813@together` (research.md
       §R1, verified 2026-09-08); derived `deepseek-ocr@self-host` on `l40s@runpod`
       with `seconds_per_unit: 15` sourced from Replicate's published typical run time,
       note saying so and that a bench run should replace it.
-- [ ] T016 [P] [US2] Tests: `TestDeployments*` — load, validate, derive math, missing/
+- [x] T016 [P] [US2] Tests: `TestDeployments*` — load, validate, derive math, missing/
       expired rate, bench missing, attestation expiry, unattested with/without catalog,
       drift, `query deployments` exit codes; `TestShippedDeploymentsFile`,
       `TestShippedGpuRatesFile` (shape + attestation completeness, clock pinned).
@@ -75,14 +75,14 @@ derived where self-hosted, cross-checked where a catalog exists.
 
 **Goal**: a second per-host catalog, demoted.
 
-- [ ] T017 [US3] `HF_ROUTER_URL`; `_normalize_hf_router(data)` → `{hf_id: {canonical_host:
+- [x] T017 [US3] `HF_ROUTER_URL`; `_normalize_hf_router(data)` → `{hf_id: {canonical_host:
       {in,out,context_length,status}}}`; providers without pricing kept priceless.
-- [ ] T018 [US3] `fetch_hf_router(url, fetcher)`; `run()` and `ensure_discovery` fetch it
+- [x] T018 [US3] `fetch_hf_router(url, fetcher)`; `run()` and `ensure_discovery` fetch it
       with LiteLLM's failure semantics (`_last_known_layer(..., "hf_router")`, warning).
-- [ ] T019 [US3] `_emit_discovery`/`_load_discovery`: add `hf_router` (tolerate absence).
-- [ ] T020 [US3] `overrides.json`: add `hf_id` to kimi-k3, glm-5.2, deepseek-v4-pro,
+- [x] T019 [US3] `_emit_discovery`/`_load_discovery`: add `hf_router` (tolerate absence).
+- [x] T020 [US3] `overrides.json`: add `hf_id` to kimi-k3, glm-5.2, deepseek-v4-pro,
       claude-*, gpt-* where a Hub id exists; `TestShippedOverridesFile` asserts shape.
-- [ ] T021 [P] [US3] Tests: `TestHfRouter` — normaliser on a fixture payload, priceless
+- [x] T021 [P] [US3] Tests: `TestHfRouter` — normaliser on a fixture payload, priceless
       provider retained, fetch failure reuses last layer and refresh succeeds, older
       discovery.json without the layer still loads.
 
@@ -93,15 +93,15 @@ cold-start unchanged.
 
 **Goal**: the price at *my* host.
 
-- [ ] T022 [US4] `canonical_host(name)` + `HOST_ALIASES`; tests for every form in
+- [x] T022 [US4] `canonical_host(name)` + `HOST_ALIASES`; tests for every form in
       data-model.md.
-- [ ] T023 [US4] `host_rows(ctx, model)` → merged rows from the endpoints snapshot and
+- [x] T023 [US4] `host_rows(ctx, model)` → merged rows from the endpoints snapshot and
       `hf_router` (via `hf_id`), canonicalised, `source` per row, sorted by
       `_blended_cost`; priceless rows last and never candidates.
-- [ ] T024 [US4] `_query_hosts(ctx, model)`; `parse_args` choice `hosts`.
-- [ ] T025 [US4] `--host` on `query` parser; `_query_price` resolution order
+- [x] T024 [US4] `_query_hosts(ctx, model)`; `parse_args` choice `hosts`.
+- [x] T025 [US4] `--host` on `query` parser; `_query_price` resolution order
       deployment → catalog row → not found; `_query_cheapest` restricts candidates.
-- [ ] T026 [P] [US4] Tests: `TestQueryHosts`, `TestQueryPriceHost`,
+- [x] T026 [P] [US4] Tests: `TestQueryHosts`, `TestQueryPriceHost`,
       `TestQueryCheapestHost` — merge, canonicalisation, deployment wins, baseline
       fallback, not-found exit 2, priceless host never cheapest, two SKUs at one host.
 
@@ -109,14 +109,14 @@ cold-start unchanged.
 
 ## Phase 5: Polish & acceptance
 
-- [ ] T027 [P] README.md: deployments / hosts / units sections; CLI surface; file tree;
+- [x] T027 [P] README.md: deployments / hosts / units sections; CLI surface; file tree;
       envelope example; correct the stale "router API is auth-walled" note.
-- [ ] T028 [P] skills/llm-pricing/SKILL.md: `hosts`, `--host`, `deployments`, units.
-- [ ] T029 Run `python tests/test_contract_drift.py --fix`; suite green; grep for
+- [x] T028 [P] skills/llm-pricing/SKILL.md: `hosts`, `--host`, `deployments`, units.
+- [x] T029 Run `python tests/test_contract_drift.py --fix`; suite green; grep for
       ungoverned restatements of the unit vocabulary.
-- [ ] T030 `autoresearch.checks.sh`: offline smoke for `hosts`, `deployments`,
+- [x] T030 `autoresearch.checks.sh`: offline smoke for `hosts`, `deployments`,
       `price --host`.
-- [ ] T031 Acceptance: `uv run` the estimator end-to-end (SC-003); cold-start ruler
+- [x] T031 Acceptance: `uv run` the estimator end-to-end (SC-003); cold-start ruler
       (`autoresearch.sh` bench) within noise of 34 ms.
 - [ ] T032 `claude_review/` delta report at the final commit.
 

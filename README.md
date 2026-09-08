@@ -2,7 +2,7 @@
 
 Single source of truth for LLM pricing, shared by Hermes, Pi, and `llm-cost-estimator`.
 
-**Status: pipeline built; consumer wiring documented.** `fetch_pricing.py`, `overrides.json`, and `cache/pricing.json` exist; the stdlib-only CLI fetches on demand, merges by precedence (overrides > LiteLLM > OpenRouter), and emits a TTL-gated cache with freshness metadata. Consumers are wired per the contract below.
+**Status: pipeline built; consumer wiring documented.** `fetch_pricing.py`, `overrides.json`, and `cache/pricing.json` exist; the stdlib-only CLI fetches on demand, merges by precedence (overrides > OpenRouter catalog > LiteLLM), prices **what you actually run** from `deployments.json` in its native unit, and emits a TTL-gated cache with freshness metadata. Consumers are wired per the contract below.
 
 ## Problem
 
@@ -28,11 +28,13 @@ Optional later upgrade: a keep-warm cron that calls the *same script* daily (pre
 | Layer | Source | Role | Verified (2026-08-30) |
 | :-- | :-- | :-- | :-- |
 | 1. **Overrides** (truth) | Local `overrides.json` | Tokenizer mappings (always) and `openrouter_slug` pins; prices **only** where we pay something the catalog does not list (e.g. z.ai GLM direct), marked `negotiated` | Existing `llm-cost-estimator/data/pricing.json` becomes this |
+| 1b. **Deployments** (truth) | Local `deployments.json` (+ `gpu_rates.json`) | **What we actually run**: a model at a named host or on our own GPU, priced in its native unit (`per_1m_tokens`, `per_page`, `per_run`, …), attested. Self-hosted entries derive `$/page` from an attested GPU rate and a benchmark measurement. Cross-checked against the per-host catalogs where a per-token equivalent exists | Seeded 2026-09-08 from public pages; see `specs/005-cost-per-unit/` |
 | 2. **Cheapest host** (baseline) | OpenRouter `GET /api/v1/models/{author}/{slug}/endpoints` (public, no auth) | Per-provider endpoint pricing: provider name, quantization, cache-read price. Primary source for `query cheapest` on OpenRouter-routed models | ✅ 17 endpoints for `moonshotai/kimi-k3` (Makora, DeepInfra, Morph, ...) |
 | 3. **Catalog baseline** (discovery) | OpenRouter `GET /api/v1/models` | Canonical per-model price incl. cache-read/write + conditional pricing flag; slug resolution for the endpoints API | ✅ 396 models, all with pricing blocks |
 | 4. **Fallback / cross-check** | LiteLLM `model_prices_and_context_window.json` (GitHub raw) | Vendor-direct pricing OpenRouter does not list (z.ai GLM official rates); demoted fallback for `query cheapest` | ✅ 3,365 entries |
+| 5. **Per-host catalog, second source** (verifier) | Hugging Face router `GET https://router.huggingface.co/v1/models` (public, no auth, [documented](https://huggingface.co/docs/inference-providers/hub-api)) | Per-provider prices in USD per 1M tokens for every chat model HF routes, plus context length, status, measured latency/throughput. Covers host/model pairs OpenRouter does not route and distinguishes variants it merges. Demoted like LiteLLM: a failure reuses the last known layer | ✅ 139 models × 14 hosts (2026-09-08); 6/7 exact vs host pages — the miss was a promo HF had not ingested |
 
-**Hugging Face is NOT in the automated path.** Empirically tested: hub API (`/api/models/{id}`) carries no pricing, router API is auth-walled, model-card frontmatter has no `inference_providers` block (checked Kimi-K3, DeepSeek-V3, Qwen3.5). HF's provider-price tables on the website come from an internal endpoint with no public contract. HF = manual reference only.
+**On Hugging Face.** The 2026-08-30 finding that the router API was auth-walled is no longer true: `/v1/models` answers without a token and its `pricing` field is a documented contract (`specs/005-cost-per-unit/research.md` §R4). It is mapped to tracked models by `hf_id` in `overrides.json`. HF's own MCP server exposes no pricing tool; the REST endpoint is the source. The Hub's model-card metadata still carries no prices.
 
 ### Caveats
 
@@ -51,7 +53,7 @@ Optional later upgrade: a keep-warm cron that calls the *same script* daily (pre
 
 Every consumer reads the **same file**: `<repo>/cache/pricing.json` (repo-local).
 
-**Schema you read:** `{ "fetched_at": "<ISO-8601 UTC>", "ttl_hours": 168, "freshness": "fresh", "needs_review": ["<model_id>", ...], "models": { "<model_id>": { "in": <$/1M>, "out": <$/1M>, "tokenizer": "...", "fallback" (optional), "source": "override"|"openrouter"|"litellm", "catalog" (optional), "drift" (optional), "review" (optional) } } }`. Every entry names its `unit`; per-token prices are USD per 1M tokens.
+**Schema you read:** `{ "fetched_at": "<ISO-8601 UTC>", "ttl_hours": 168, "freshness": "fresh", "needs_review": ["<model_id>", ...], "models": { "<model_id>": { "in": <$/1M>, "out": <$/1M>, "tokenizer": "...", "fallback" (optional), "source": "override"|"openrouter"|"litellm", "catalog" (optional), "drift" (optional), "review" (optional) } } }`. Every entry names its `unit`; per-token prices are USD per 1M tokens. A sixth key, `"deployments": { "<model>@<host>": { "unit": ..., <price fields per unit>, "source": "deployment", "baseline": false, "attestation": "valid"|"expired"|"missing", "catalog" (optional cross-check), "drift" (optional), "rate" (derived entries), "review" (optional) } }`, carries what you actually run — see [Deployments](#deployments-what-you-actually-run).
 
 The envelope keys are fixed:
 
@@ -111,15 +113,17 @@ Per-token prices are USD per 1M tokens. A unit's fields are never reused for ano
 ```
 llm-pricing-sot/
 ├── README.md                 # this file
-├── overrides.json            # layer 1 — hand-maintained, highest precedence
-├── fetch_pricing.py          # stdlib-only pipeline: fetch → merge → emit (T-001..T-008 done)
-├── cache/
-│   ├── pricing.json          # merged output: {fetched_at, freshness, ttl_hours, models: {...}}
-│   ├── discovery.json        # raw layers: {fetched_at, ttl_hours, litellm, openrouter}
-│   └── endpoints/            # per-slug endpoint snapshots for `query cheapest`
-├── tests/                    # 58 tests: merge precedence, TTL, stale-fallback, queries
-├── specs/                    # SDD spec for the pipeline (T-001..T-008)
-└── .specify/                 # spec-kit workspace
+├── overrides.json            # truth 1 — tokenizers, catalog pins (openrouter_slug, hf_id), attested per-token rates
+├── deployments.json          # truth 1b — what you actually run, any unit, attested (quoted or derived)
+├── gpu_rates.json            # attested USD/hour keyed <gpu>@<provider>; input to derived deployments
+├── fetch_pricing.py          # stdlib-only pipeline: fetch → merge → verify → emit, plus the query surface
+├── cache/                    # gitignored, regenerated on demand
+│   ├── pricing.json          # {fetched_at, freshness, ttl_hours, needs_review, models, deployments}
+│   ├── discovery.json        # raw layers: {fetched_at, ttl_hours, openrouter, litellm, hf_router}
+│   └── endpoints/            # per-slug OpenRouter endpoint snapshots (per-host prices)
+├── tests/                    # hermetic suite + the contract-drift gate (python -m unittest discover -s tests)
+├── specs/                    # spec-kit features 001–005
+└── .specify/                 # spec-kit workspace; memory/constitution.md is v3.0.0
 ```
 
 **CLI surface (implemented):**
@@ -131,7 +135,16 @@ fetch_pricing.py query cheapest <model>         # cheapest OpenRouter endpoint +
 fetch_pricing.py query list                    # all models in cache
 fetch_pricing.py query fresh                   # freshness metadata
 fetch_pricing.py query review                  # the review queue; exit 1 while non-empty
+fetch_pricing.py query hosts <model>           # every host serving it, both catalogs, cheapest first, + deployments
+fetch_pricing.py query price <model> --host H  # the price AT host H: your deployment there, else the catalog's row there
+fetch_pricing.py query cheapest <model> --host H   # cheapest SKU at H only
+fetch_pricing.py query deployments             # what you actually run, priced in its native unit
 ```
+
+`--host` takes a canonical name (`together`, `baseten`, `fireworks`, `zai`, `deepinfra`, `novita`,
+`moonshot`, `self-host`, …); `BaseTen` and `baseten` are one host. The answer is *that host's*
+number — never the cheapest host's — which is the question `cheapest` was silently answering
+instead.
 
 `query review` is the work list for `needs_review`. It shows the price you declared
 against the one now being served, so each row is a decision — attest the declared price,
@@ -167,7 +180,7 @@ Merged model entry shape (as emitted — matches llm-cost-estimator's expectatio
 ```json
 {
   "gpt-5.2": {
-    "in": 0.40, "out": 1.60,
+    "in": 0.40, "out": 1.60, "unit": "per_1m_tokens",
     "tokenizer": "tiktoken:o200k_base",
     "source": "override",
     "catalog": {"slug": "openai/gpt-5.2", "source": "openrouter", "in": 1.75, "out": 14.00},
@@ -240,12 +253,49 @@ All of these fields are additive: consumers that ignore them are unaffected.
 
 Per-provider alternatives are **not** inlined into cache entries — they live in `cache/endpoints/<slug>.json` and are surfaced by `query cheapest`, which returns the authoritative override alongside the cheapest endpoint (provider, price, quantization, variant count).
 
+### Deployments: what you actually run
+
+`overrides.json` answers "what does the catalog say a model costs per token". That is the right
+question for proprietary models and for hosted open-weight ones — and the wrong question for the
+models you run yourself, which are sold per page, per run, per GPU-hour, flat, or not at all.
+`deployments.json` records the deployments you actually use, each priced in its **native unit**,
+and is the truth for cost. The catalog is demoted to a verifier.
+
+Keyed `<model>@<host>`. Two forms:
+
+| Form | You write | The pipeline emits |
+| :-- | :-- | :-- |
+| **Quoted** | `unit` + that unit's price fields + `note` + `verified_at` | the price, `attestation`, and — for a per-token deployment at a catalog host — `catalog` (the host's catalog row) and `drift` |
+| **Derived** (self-host) | `unit` + `derive: {gpu, seconds_per_unit, bench_run}` + `note` + `verified_at` | `usd_per_hour × seconds_per_unit / 3600`, and `rate` naming exactly which GPU rate was used |
+
+A derived price is never guessed: a `derive.gpu` missing from `gpu_rates.json` yields
+`gpu-rate-missing` and no price; a missing `seconds_per_unit` yields `bench-missing`. The
+`seconds_per_unit` is a **measurement** — your benchmark produces it, this repo records it with
+the run id that measured it. `gpu_rates.json` is keyed `<gpu>@<provider>` and never averaged
+across providers, because you pay one of them.
+
+The trust rules are the overrides rules, verbatim: an attested price stands and is cross-checked
+at the *named* host; an unattested one (`unattested-deployment`) yields to the catalog price
+where one exists there and is kept-and-flagged where none does; an expired attestation keeps
+its price and asks a human. GPU rates are prices and expire too (`gpu-rate-expired`,
+`gpu-rate-unattested`). An invalid entry is emitted with no price so it is reported, never
+silently dropped. Flagged ids roll up into `needs_review` and degrade the exit code exactly as
+a flagged override does; `query deployments` shows the table.
+
+The seeded entries are real prices verified against public pages on 2026-09-08, and the derived
+OCR entry's `seconds_per_unit` is marked `PLACEHOLDER` — replace the hosts with the ones you use
+and the measurement with a bench run. Full shapes, review reasons and worked examples:
+`specs/005-cost-per-unit/` (`data-model.md`, `quickstart.md`).
+
 ## Build status — DONE
 
 - ✅ `fetch_pricing.py` — fetch (OpenRouter models + `/endpoints`, LiteLLM), merge (attested overrides > OpenRouter catalog > LiteLLM), emit cache with freshness + review metadata, stale-fallback when the catalog is unreachable
 - ✅ `overrides.json` — seeded from `~/llm/llm-cost-estimator/data/pricing.json`; carries optional `openrouter_slug` where the short alias can't be resolved from the catalog
 - ✅ Attested-price enforcement — unattested hand-typed prices are discarded for the live catalog price; attestations expire after 90 days; anything reviewable degrades the exit code
-- ✅ Tests — 120 passing: merge precedence, TTL logic, stale-fallback, query surface, catalog linkage, attestation + review queue, atomic writes, cheapest ranking, pin authority, degraded exit codes, shipped-data shape
+- ✅ Tests — hermetic suite (`python -m unittest discover -s tests`): merge precedence, TTL logic, stale-fallback, query surface, catalog linkage, attestation + review queue, atomic writes, cheapest ranking, pin authority, degraded exit codes, shipped-data shape, units, deployments + derivation, HF router, per-host queries, and the contract-drift gate. No count is stated here — a number in prose is exactly the restatement that drifts
+- ✅ Units — every price carries a `unit` from a vocabulary derived from code into the governed documents; a per-page price can never land in `in`/`out`
+- ✅ Deployments — `deployments.json` + `gpu_rates.json`: what you actually run, quoted or derived, attested, cross-checked at the named host, emitted under `deployments`
+- ✅ Second per-host catalog — the Hugging Face router, demoted; `query hosts`, `price --host`, `cheapest --host`
 - ✅ Cache — `cache/pricing.json` + `discovery.json` + `endpoints/` emitting per the contract
 - 🔜 Consumer wiring — llm-cost-estimator integration via `LLM_PRICING_SOT_DIR` / `--pricing-dir` documented but not yet shipped in the estimator
 
@@ -273,3 +323,9 @@ partial write.
 - Whether models outside the overrides list should be priceable at all. `discovery.json`
   already holds ~3,200 of them; the emitted cache deliberately does not (`tokenizer` gate,
   ratified in `specs/001-pricing-query/data-model.md`). Changing that is a spec-level decision.
+- **The seeded deployments are examples, not your bill.** They were verified against public
+  pages on 2026-09-08, but Together and Baseten may not be where you run things, and the OCR
+  entry's `seconds_per_unit` is Replicate's published run time, not a bench measurement.
+  `deepseek-v4-pro-0813@together` has no catalog cross-check because no tracked model maps to
+  the `-0813` Hub variant; add an override with `hf_id: deepseek-ai/DeepSeek-V4-Pro-0813` if
+  that variant matters.

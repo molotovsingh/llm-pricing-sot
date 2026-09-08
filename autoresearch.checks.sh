@@ -26,4 +26,9 @@ smoke 0 query price gpt-4o --offline
 smoke 0 query list --offline
 smoke 0 query fresh --offline
 smoke 0 query cheapest gpt-4o --offline
+# Spec 005: the per-host and deployments surfaces. Same contract, same JSON rule.
+smoke 0 query hosts glm-5.2 --offline
+smoke 0 query price glm-5.2 --host together --offline
+smoke 0 query cheapest glm-5.2 --host baseten --offline
+smoke 0 query deployments --offline
 echo "checks: suite + offline smoke OK"
