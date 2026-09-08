@@ -5,6 +5,7 @@ reviewed; `quality-pass/latest.md` always mirrors the newest report.
 
 | # | When (IST) | Commit | Branch | Headline | P0 | P1 | P2 | P3 | Report |
 |---|---|---|---|---|---|---|---|---|---|
+| 4 | 2026-09-08 19:05 | `67bfe98` | `005-cost-per-unit` | Delta over the spec-005 refit (5 commits). The catalog is demoted to verifier; `deployments.json` is the truth for cost in native units; HF router as second per-host catalog; `hosts` / `--host` queries. Every SC verified by experiment. No open P1; residue is user-owned data. | 0 | 0 | 2 | 4 | [2026-09-08-67bfe98.md](quality-pass/2026-09-08-67bfe98.md) |
 | 3 | 2026-09-08 09:02 | `374f234` | `004-clear-review-queue` | Delta. Whole P1/P2 queue cleared and verified by experiment (faked clock, two-direction guard, 26-invocation differential). No open P0/P1; one human decision left. | 0 | 0 | 1 | — | [2026-09-08-374f234.md](quality-pass/2026-09-08-374f234.md) |
 | 2 | 2026-09-08 08:37 | `6a12f98` | `004-clear-review-queue` | All three leverage fixes landed; `risky` cleared. Risk moved into the verification layer — a suite assertion goes red on 2026-11-15, and the drift gate misses two stale restatements in its own source file. | 0 | 1 | 3 | 11 | [2026-09-08-6a12f98.md](quality-pass/2026-09-08-6a12f98.md) |
 | 1 | 2026-08-31 09:00 | `9ce70bc` | `002-pricing-endpoints` | First pass. The pipeline's attestation work never reached the query surface; `_resolve_slug` guessed after a retired pin. | 0 | 2 | 7 | 5 | [`agent_review/…/2026-08-31-9ce70bc.md`](../agent_review/quality-pass/2026-08-31-9ce70bc.md) † |
