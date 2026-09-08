@@ -97,13 +97,19 @@ def parse_args(argv=None):
     q = sub.add_parser("query", help="run pricing queries (price, cheapest, list, fresh, "
                                      "review, deployments)")
     q.add_argument("action", choices=["price", "cheapest", "list", "fresh", "review",
-                                      "deployments"],
+                                      "deployments", "hosts"],
                    help="query action")
     q.add_argument("model", nargs="?", default=None, help="model id (for price/cheapest)")
     q.add_argument(
         "--offline",
         action="store_true",
         help="never hit the network: serve cached/stale data or report not found",
+    )
+    q.add_argument(
+        "--host",
+        default=None,
+        help="price at a named host (together, baseten, fireworks, zai, self-host, ...): "
+             "a recorded deployment there wins, else the catalog's price at that host",
     )
     return parser.parse_args(argv)
 
@@ -678,7 +684,7 @@ def derive_deployment_price(entry, gpu_rates, now=None):
     return reason, fields
 
 
-def host_rows(model, overrides, endpoints_dir=ENDPOINTS_CACHE_DIR, discovery=None):
+def host_rows(model, overrides, endpoints_dir=ENDPOINTS_CACHE_DIR, discovery=None, slug=None):
     """Every (host, sku) price for a model from the per-host catalogs (spec 005, US4).
 
     Rows come from the OpenRouter endpoint snapshot for the model's pinned slug
@@ -691,7 +697,7 @@ def host_rows(model, overrides, endpoints_dir=ENDPOINTS_CACHE_DIR, discovery=Non
     rows = []
     entry = (overrides or {}).get(model)
     entry = entry if isinstance(entry, dict) else {}
-    slug = entry.get("openrouter_slug")
+    slug = slug or entry.get("openrouter_slug")  # a resolved slug outranks the pin
     if slug:
         snap = _load_endpoint_snapshot(_endpoint_snapshot_path(slug, endpoints_dir))
         for e in (snap or {}).get("endpoints", []):
@@ -1157,9 +1163,12 @@ class _QueryContext:
 
     def __init__(self, cache, freshness, offline, ttl_hours, now,
                  overrides_path, discovery_path, endpoints_dir,
-                 openrouter_fetcher, litellm_fetcher, hf_fetcher=None):
+                 openrouter_fetcher, litellm_fetcher, hf_fetcher=None, host=None):
         self.cache = cache
         self.hf_fetcher = hf_fetcher
+        self.host = canonical_host(host) if host else None
+        self._overrides = None
+        self._host_views = {}
         self.freshness = freshness
         self.offline = offline
         self.ttl_hours = ttl_hours
@@ -1191,6 +1200,42 @@ class _QueryContext:
         disc = self.discovery or {}
         for layer_name in ("litellm", "openrouter"):
             yield layer_name, (disc.get(layer_name) or {})
+
+    def raw_overrides(self):
+        """overrides.json as declared (pins intact), loaded once per query."""
+        if self._overrides is None:
+            self._overrides = load_overrides(self.overrides_path)
+        return self._overrides
+
+    def host_view(self, model):
+        """(rows, freshness): a model's per-host catalog from both sources.
+
+        Refreshes the endpoint snapshot exactly as `cheapest` does -- online and
+        stale means one fetch; offline serves what is on disk. Cached per model
+        so `hosts`, `price --host` and `cheapest --host` share one read.
+        """
+        if model in self._host_views:
+            return self._host_views[model]
+        overrides = self.raw_overrides()
+        catalog_ids = set((self.discovery or {}).get("openrouter", {}).keys())
+        slug = _resolve_slug(catalog_ids, model, overrides) if catalog_ids else None
+        freshness = self.discovery_freshness
+        if slug is not None:
+            _, ep_freshness = ensure_endpoints(model, slug, self.offline, self.ttl_hours,
+                                               self.now, fetcher=self.openrouter_fetcher,
+                                               endpoints_dir=self.endpoints_dir)
+            if ep_freshness != "no-data":
+                freshness = ep_freshness
+        rows = host_rows(model, overrides, self.endpoints_dir, self.discovery, slug)
+        self._host_views[model] = (rows, freshness)
+        return rows, freshness
+
+    def deployments_for(self, model):
+        """Recorded deployments of a model, each carrying its id."""
+        if not isinstance(self.cache, dict):
+            return []
+        return [dict(e, id=did) for did, e in sorted((self.cache.get("deployments") or {}).items())
+                if isinstance(e, dict) and e.get("model") == model]
 
     def out(self, payload, freshness, degraded=False):
         """Print the JSON answer on stdout and return its exit code."""
@@ -1288,7 +1333,23 @@ def _query_list(ctx):
 
 
 def _query_price(ctx, model):
-    """`query price` -- the tracked price, else a discovery baseline, else not found."""
+    """`query price` -- the tracked price, else a discovery baseline, else not found.
+
+    With `--host`: the recorded deployment at that host wins (truth, `baseline:
+    false`); else the catalog's cheapest priced row there (`baseline: true`);
+    else not found. The host's number, never the cheapest host's.
+    """
+    if ctx.host:
+        for dep in ctx.deployments_for(model):
+            if canonical_host(dep.get("host")) == ctx.host:
+                dep.update({"model": model, "freshness": ctx.freshness})
+                return ctx.out(dep, ctx.freshness, bool(dep.get("review")))
+        rows, freshness = ctx.host_view(model)
+        row = _catalog_row_at_host(rows, ctx.host)
+        if row is not None:
+            return ctx.out(dict(row, model=model, freshness=freshness), freshness)
+        return ctx.out({"model": model, "host": ctx.host, "found": False,
+                        "freshness": ctx.freshness}, "no-data")
     if model in ctx.models:
         entry = dict(ctx.models[model])
         entry.update({"model": model, "baseline": False, "freshness": ctx.freshness})
@@ -1349,6 +1410,9 @@ def _query_cheapest(ctx, model):
     authoritative = dict(ctx.models[model]) if model in ctx.models else None
     degraded = bool((authoritative or {}).get("review"))
 
+    if ctx.host:
+        return _cheapest_at_host(ctx, model, authoritative, degraded)
+
     code = _cheapest_by_endpoint(ctx, model, authoritative, degraded)
     if code is not None:
         return code
@@ -1370,6 +1434,35 @@ def _query_cheapest(ctx, model):
                     "ranked_by": f"blended-{CHEAPEST_IO_RATIO}:1",
                     "variants": len(variants), "freshness": ctx.discovery_freshness},
                    ctx.discovery_freshness, degraded)
+
+
+def _cheapest_at_host(ctx, model, authoritative, degraded):
+    """`query cheapest --host` -- the cheapest priced SKU at one host, both catalogs.
+
+    A host with no per-token price (a flat-rate provider) has no candidates and
+    is reported not found rather than ranked at zero.
+    """
+    rows, freshness = ctx.host_view(model)
+    candidates = [r for r in rows if r.get("host") == ctx.host and "in" in r and "out" in r]
+    if not candidates:
+        return ctx.out({"model": model, "host": ctx.host, "found": False,
+                        "freshness": ctx.freshness}, "no-data")
+    best = min(candidates, key=_blended_cost)
+    payload = dict(best, model=model, ranked_by=f"blended-{CHEAPEST_IO_RATIO}:1",
+                   authoritative=authoritative, variants=len(candidates), freshness=freshness)
+    return ctx.out(payload, freshness, degraded)
+
+
+def _query_hosts(ctx, model):
+    """`query hosts` -- every host serving a model, from both catalogs, cheapest
+    first, plus any deployments recorded for it. The depth view."""
+    rows, freshness = ctx.host_view(model)
+    deployments = ctx.deployments_for(model)
+    if not rows and not deployments:
+        return ctx.out({"model": model, "found": False, "freshness": ctx.freshness}, "no-data")
+    return ctx.out({"model": model, "hosts": rows, "deployments": deployments,
+                    "freshness": freshness},
+                   freshness, any(d.get("review") for d in deployments))
 
 
 def _print_deployments_table(rows, stream=None):
@@ -1421,7 +1514,8 @@ def query_main(args, openrouter_fetcher=_default_fetcher, litellm_fetcher=_defau
                                     deployments_path, gpu_rates_path, hf_fetcher)
     ctx = _QueryContext(cache, _freshness_status(cache, ttl_hours, now), offline,
                         ttl_hours, now, overrides_path, discovery_path, endpoints_dir,
-                        openrouter_fetcher, litellm_fetcher, hf_fetcher)
+                        openrouter_fetcher, litellm_fetcher, hf_fetcher,
+                        host=getattr(args, "host", None))
 
     if action == "fresh":
         return _query_fresh(ctx)
@@ -1438,6 +1532,8 @@ def query_main(args, openrouter_fetcher=_default_fetcher, litellm_fetcher=_defau
     if model is None:
         print(json.dumps({"error": "model argument required for %s" % action}), file=sys.stderr)
         return 2
+    if action == "hosts":
+        return _query_hosts(ctx, model)
     if action == "price":
         return _query_price(ctx, model)
     if action == "cheapest":

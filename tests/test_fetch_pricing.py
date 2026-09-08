@@ -1945,3 +1945,172 @@ class TestHfRouterInRun(unittest.TestCase):
         entry = cache["deployments"]["kimi-k3@together"]
         self.assertEqual(entry["catalog"]["source"], "hf-router")
         self.assertNotIn("drift", entry)
+
+
+# ---------------- spec 005 US4: the price at *my* host ----------------
+
+class HostQueryBase(unittest.TestCase):
+    """GLM-5.2 served by two catalogs, with one recorded deployment at Baseten.
+
+    OpenRouter endpoints: DeepInfra 0.4875/1.56 (the cheapest), BaseTen twice
+    (1.4/4.4 fp8 and 2.1/6.6 fp8), Together 1.4/4.4. HF router: Together 1.4/4.4,
+    Fireworks 1.4/4.4 (HF-only), Featherless with no price (flat-rate).
+    """
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        d = self.dir.name
+        self.cache_path = os.path.join(d, "pricing.json")
+        self.overrides_path = os.path.join(d, "overrides.json")
+        self.discovery_path = os.path.join(d, "discovery.json")
+        self.endpoints_dir = os.path.join(d, "endpoints")
+        os.makedirs(self.endpoints_dir)
+        with open(self.overrides_path, "w", encoding="utf-8") as fh:
+            json.dump({"glm-5.2": {"tokenizer": "tok", "openrouter_slug": "z-ai/glm-5.2",
+                                   "hf_id": "zai-org/GLM-5.2"}}, fh)
+        with open(self.discovery_path, "w", encoding="utf-8") as fh:
+            json.dump({"fetched_at": _now_iso(), "ttl_hours": 24, "litellm": {},
+                       "openrouter": {"z-ai/glm-5.2": {"in": 0.966, "out": 3.036, "source": "openrouter"}},
+                       "hf_router": {"zai-org/GLM-5.2": {
+                           "together": {"in": 1.4, "out": 4.4, "status": "live"},
+                           "fireworks": {"in": 1.4, "out": 4.4, "status": "live"},
+                           "featherless": {"status": "live"}}}}, fh)
+        with open(os.path.join(self.endpoints_dir, "z-ai__glm-5.2.json"), "w", encoding="utf-8") as fh:
+            json.dump({"fetched_at": _now_iso(), "slug": "z-ai/glm-5.2", "endpoints": [
+                {"provider_name": "DeepInfra", "quantization": "fp4", "in": 0.4875, "out": 1.56},
+                {"provider_name": "BaseTen", "quantization": "fp8", "in": 1.4, "out": 4.4},
+                {"provider_name": "BaseTen", "quantization": "fp8", "in": 2.1, "out": 6.6},
+                {"provider_name": "Together", "quantization": None, "in": 1.4, "out": 4.4}]}, fh)
+        self.deployment = {"model": "glm-5.2", "host": "baseten", "unit": "per_1m_tokens",
+                           "in": 1.4, "out": 4.4, "source": "deployment", "baseline": False,
+                           "attestation": "valid", "note": "baseten.co/pricing",
+                           "verified_at": "2026-09-08"}
+        self.write_cache({"glm-5.2@baseten": self.deployment})
+
+    def write_cache(self, deployments):
+        models = {"glm-5.2": {"in": 0.966, "out": 3.036, "tokenizer": "tok", "unit": "per_1m_tokens",
+                              "source": "openrouter"}}
+        flagged = [k for k, v in deployments.items() if v.get("review")]
+        emit(build_cache(models, 24, _now_iso(), "fresh", flagged, deployments), self.cache_path)
+
+    def query(self, action, model="glm-5.2", host=None):
+        args = argparse.Namespace(action=action, model=model, offline=True, ttl_hours=24, host=host)
+        out, err = io.StringIO(), io.StringIO()
+
+        def never(url):
+            raise AssertionError("offline query must not fetch")
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = query_main(args, cache_path=self.cache_path, overrides_path=self.overrides_path,
+                              discovery_path=self.discovery_path, endpoints_dir=self.endpoints_dir,
+                              openrouter_fetcher=never, litellm_fetcher=never)
+        return code, json.loads(out.getvalue())
+
+
+class TestQueryHosts(HostQueryBase):
+    def test_lists_both_catalogs_cheapest_first_with_deployments(self):
+        code, data = self.query("hosts")
+        self.assertEqual(code, 0)
+        hosts = data["hosts"]
+        self.assertEqual(hosts[0]["host"], "deepinfra")
+        self.assertEqual({r["source"] for r in hosts}, {"openrouter-endpoints", "hf-router"})
+        self.assertEqual([r["source"] for r in hosts if r["host"] == "fireworks"], ["hf-router"])
+        self.assertEqual(len([r for r in hosts if r["host"] == "baseten"]), 2)  # two SKUs kept
+        self.assertEqual(hosts[-1]["host"], "featherless")
+        self.assertNotIn("in", hosts[-1])
+        self.assertTrue(all(r["baseline"] and r["unit"] == DEFAULT_UNIT for r in hosts))
+        self.assertEqual([d["id"] for d in data["deployments"]], ["glm-5.2@baseten"])
+        self.assertFalse(data["degraded"])
+
+    def test_flagged_deployment_degrades_the_answer(self):
+        self.write_cache({"glm-5.2@baseten": dict(self.deployment, review="attestation-expired")})
+        code, data = self.query("hosts")
+        self.assertEqual(code, 1)
+        self.assertTrue(data["degraded"])
+
+    def test_unknown_model_is_not_found_exit_2(self):
+        code, data = self.query("hosts", model="nope")
+        self.assertEqual(code, 2)
+        self.assertFalse(data["found"])
+
+    def test_hosts_requires_a_model(self):
+        args = argparse.Namespace(action="hosts", model=None, offline=True, ttl_hours=24, host=None)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            code = query_main(args, cache_path=self.cache_path, overrides_path=self.overrides_path,
+                              discovery_path=self.discovery_path, endpoints_dir=self.endpoints_dir)
+        self.assertEqual(code, 2)
+
+
+class TestQueryPriceAtHost(HostQueryBase):
+    def test_recorded_deployment_wins(self):
+        code, data = self.query("price", host="baseten")
+        self.assertEqual(code, 0)
+        self.assertEqual((data["in"], data["out"]), (1.4, 4.4))
+        self.assertEqual((data["source"], data["baseline"]), ("deployment", False))
+        self.assertEqual(data["id"], "glm-5.2@baseten")
+
+    def test_host_name_is_canonicalised(self):
+        code, data = self.query("price", host="BaseTen")
+        self.assertEqual(data["source"], "deployment")
+
+    def test_catalog_row_at_host_is_baseline(self):
+        # SC-001: Together's own price, not the cheapest host's.
+        code, data = self.query("price", host="together")
+        self.assertEqual(code, 0)
+        self.assertEqual((data["in"], data["out"]), (1.4, 4.4))
+        self.assertTrue(data["baseline"])
+        self.assertEqual(data["host"], "together")
+
+    def test_hf_only_host_is_served(self):
+        code, data = self.query("price", host="fireworks-ai")
+        self.assertEqual((code, data["source"]), (0, "hf-router"))
+
+    def test_unpriced_host_is_not_found(self):
+        code, data = self.query("price", host="featherless")
+        self.assertEqual(code, 2)
+        self.assertFalse(data["found"])
+
+    def test_unknown_host_is_not_found(self):
+        code, data = self.query("price", host="novita")
+        self.assertEqual(code, 2)
+        self.assertEqual(data["host"], "novita")
+
+    def test_flagged_deployment_degrades(self):
+        self.write_cache({"glm-5.2@baseten": dict(self.deployment, review="attestation-expired")})
+        code, data = self.query("price", host="baseten")
+        self.assertEqual(code, 1)
+        self.assertTrue(data["degraded"])
+
+    def test_without_host_the_tracked_price_is_unchanged(self):
+        code, data = self.query("price")
+        self.assertEqual((code, data["in"], data["baseline"]), (0, 0.966, False))
+
+
+class TestQueryCheapestAtHost(HostQueryBase):
+    def test_restricts_to_the_host_and_picks_the_cheapest_sku(self):
+        code, data = self.query("cheapest", host="baseten")
+        self.assertEqual(code, 0)
+        self.assertEqual((data["in"], data["out"], data["variants"]), (1.4, 4.4, 2))
+        self.assertEqual(data["host"], "baseten")
+        self.assertEqual(data["ranked_by"], "blended-3:1")
+        self.assertIsNotNone(data["authoritative"])
+
+    def test_hf_only_host_works(self):
+        code, data = self.query("cheapest", host="fireworks")
+        self.assertEqual((code, data["source"]), (0, "hf-router"))
+
+    def test_flat_rate_host_has_no_candidates(self):
+        code, data = self.query("cheapest", host="featherless")
+        self.assertEqual(code, 2)
+
+    def test_without_host_the_global_cheapest_is_unchanged(self):
+        code, data = self.query("cheapest")
+        self.assertEqual((code, data["provider"]), (0, "DeepInfra"))
+
+
+class TestHostFlagParsing(unittest.TestCase):
+    def test_host_flag_and_hosts_action(self):
+        args = parse_args(["query", "price", "glm-5.2", "--host", "Together"])
+        self.assertEqual((args.action, args.model, args.host), ("price", "glm-5.2", "Together"))
+        self.assertEqual(parse_args(["query", "hosts", "glm-5.2"]).action, "hosts")
+        self.assertIsNone(parse_args(["query", "price", "glm-5.2"]).host)
