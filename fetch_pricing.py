@@ -768,10 +768,226 @@ def _exit_for(freshness, degraded=False):
     return 0
 
 
+class _QueryContext:
+    """Request-scoped state shared by the query actions.
+
+    Built once by `query_main` so each action reads the same cache view rather
+    than re-deriving it. `discovery`/`discovery_freshness` stay None until
+    `load_discovery()` runs: `fresh` and `review` answer from the cache alone.
+    """
+
+    def __init__(self, cache, freshness, offline, ttl_hours, now,
+                 overrides_path, discovery_path, endpoints_dir,
+                 openrouter_fetcher, litellm_fetcher):
+        self.cache = cache
+        self.freshness = freshness
+        self.offline = offline
+        self.ttl_hours = ttl_hours
+        self.now = now
+        self.overrides_path = overrides_path
+        self.discovery_path = discovery_path
+        self.endpoints_dir = endpoints_dir
+        self.openrouter_fetcher = openrouter_fetcher
+        self.litellm_fetcher = litellm_fetcher
+        self.models = cache.get("models", {}) if isinstance(cache, dict) else {}
+        self.flagged = (cache.get("needs_review") or []) if isinstance(cache, dict) else []
+        self.discovery = None
+        self.discovery_freshness = "no-data"
+
+    def load_discovery(self):
+        """Load (or refresh) the discovery layer and record its freshness."""
+        self.discovery = ensure_discovery(self.offline, self.ttl_hours, self.now,
+                                          self.openrouter_fetcher, self.litellm_fetcher,
+                                          self.discovery_path)
+        if self.discovery is None:
+            self.discovery_freshness = "no-data"
+        else:
+            self.discovery_freshness = ("fresh" if is_fresh(self.discovery, self.ttl_hours,
+                                                            now=self.now) else "stale")
+        return self.discovery
+
+    def layers(self):
+        """Discovery layers in answer-preference order."""
+        disc = self.discovery or {}
+        for layer_name in ("litellm", "openrouter"):
+            yield layer_name, (disc.get(layer_name) or {})
+
+    def out(self, payload, freshness, degraded=False):
+        """Print the JSON answer on stdout and return its exit code."""
+        print(json.dumps(dict(payload, degraded=bool(degraded)), sort_keys=True))
+        return _exit_for(freshness, degraded)
+
+
+def _refresh_cache_if_stale(cache, offline, ttl_hours, now, cache_path, overrides_path,
+                            discovery_path, openrouter_fetcher, litellm_fetcher):
+    """Refresh a stale cache before answering, unless offline. Returns the cache."""
+    if offline or (cache is not None and is_fresh(cache, ttl_hours, now=now)):
+        return cache
+    # A query's --ttl-hours is a read-time gate for *this* caller. Stamping it
+    # into the shared envelope would change every other consumer's refresh
+    # cadence, so the cache keeps its own declared TTL.
+    declared = cache.get("ttl_hours") if isinstance(cache, dict) else None
+    if isinstance(declared, bool) or not isinstance(declared, int) or declared <= 0:
+        declared = DEFAULT_TTL_HOURS
+    # Keep stdout clean for the JSON answer: refresh notes go to stderr.
+    with contextlib.redirect_stdout(sys.stderr):
+        run(ttl_hours=declared, force=True, cache_path=cache_path,
+            overrides_path=overrides_path, discovery_path=discovery_path,
+            openrouter_fetcher=openrouter_fetcher, litellm_fetcher=litellm_fetcher,
+            now=now)
+    return _load_cache(cache_path)
+
+
+def _query_fresh(ctx):
+    """`query fresh` -- report cache age and how many entries need review."""
+    fetched_at = ctx.cache.get("fetched_at") if isinstance(ctx.cache, dict) else None
+    return ctx.out({"freshness": ctx.freshness, "fetched_at": fetched_at,
+                    "ttl_hours": ctx.ttl_hours, "needs_review": len(ctx.flagged)},
+                   ctx.freshness, bool(ctx.flagged))
+
+
+def _print_review_table(rows, stream=sys.stderr):
+    """Render the review work list. stderr, so stdout stays pure JSON."""
+    def _pair(a, b):
+        return f"{a}/{b}" if a is not None else "—"
+    width = max(len(r["model"]) for r in rows)
+    print(f"{'model'.ljust(width)}  {'you declared':>14}  {'now serving':>14}  reason",
+          file=stream)
+    for r in rows:
+        print(f"{r['model'].ljust(width)}  "
+              f"{_pair(r['declared_in'], r['declared_out']):>14}  "
+              f"{_pair(r['serving_in'], r['serving_out']):>14}  {r['reason']}",
+              file=stream)
+
+
+def _query_review(ctx):
+    """`query review` -- the work list for `needs_review`, declared vs serving."""
+    if ctx.cache is None:
+        return ctx.out({"needs_review": [], "freshness": ctx.freshness}, "no-data")
+    declared = load_overrides(ctx.overrides_path)
+    rows = []
+    for mid in ctx.cache.get("needs_review") or []:
+        entry = ctx.models.get(mid) or {}
+        own = declared.get(mid) or {}
+        # An id in needs_review but absent from models can only have been
+        # dropped: nothing could price it, so no entry carries the reason.
+        rows.append({"model": mid,
+                     "reason": entry.get("review", "dropped-unpriceable"),
+                     "declared_in": own.get("in"), "declared_out": own.get("out"),
+                     "serving_in": entry.get("in"), "serving_out": entry.get("out"),
+                     "serving_source": entry.get("source"),
+                     "slug": (entry.get("catalog") or {}).get("slug")})
+    if rows:
+        _print_review_table(rows)
+    return ctx.out({"needs_review": rows, "freshness": ctx.freshness},
+                   ctx.freshness, bool(rows))
+
+
+def _query_list(ctx):
+    """`query list` -- tracked models first, then discovery as baseline rows."""
+    models = [{"model": mid, "in": e.get("in"), "out": e.get("out"),
+               "source": e.get("source"), "baseline": False}
+              for mid, e in ctx.models.items()]
+    if ctx.discovery is not None:
+        for layer_name, layer in ctx.layers():
+            for mid, e in layer.items():
+                if mid in ctx.models:
+                    continue
+                models.append({"model": mid, "in": e.get("in"), "out": e.get("out"),
+                               "source": layer_name, "baseline": True})
+    status = ctx.freshness if ctx.freshness != "no-data" else ctx.discovery_freshness
+    return ctx.out({"freshness": ctx.freshness, "models": models}, status, bool(ctx.flagged))
+
+
+def _query_price(ctx, model):
+    """`query price` -- the tracked price, else a discovery baseline, else not found."""
+    if model in ctx.models:
+        entry = dict(ctx.models[model])
+        entry.update({"model": model, "baseline": False, "freshness": ctx.freshness})
+        return ctx.out(entry, ctx.freshness, bool(entry.get("review")))
+    if ctx.discovery is not None:
+        # Prefer an exact id match over a provider variant.
+        for _, layer in ctx.layers():
+            if model in layer:
+                entry = dict(layer[model])
+                entry.update({"model": model, "baseline": True,
+                              "freshness": ctx.discovery_freshness})
+                return ctx.out(entry, ctx.discovery_freshness)
+        for _, layer in ctx.layers():
+            for mid, e in layer.items():
+                if _variant_matches(model, mid):
+                    entry = dict(e)
+                    entry.update({"model": mid, "baseline": True,
+                                  "freshness": ctx.discovery_freshness})
+                    return ctx.out(entry, ctx.discovery_freshness)
+    return ctx.out({"model": model, "found": False, "freshness": ctx.freshness}, "no-data")
+
+
+def _cheapest_by_endpoint(ctx, model, authoritative, degraded):
+    """US1 (primary): rank OpenRouter's per-provider endpoints for the slug.
+
+    Returns an exit code, or None when there is no usable endpoint snapshot and
+    the caller should fall back to the variant scan.
+    """
+    catalog_ids = set((ctx.discovery or {}).get("openrouter", {}).keys())
+    if not catalog_ids:
+        return None
+    slug = _resolve_slug(catalog_ids, model, load_overrides(ctx.overrides_path))
+    if slug is None:
+        return None
+    snap, ep_freshness = ensure_endpoints(model, slug, ctx.offline, ctx.ttl_hours, ctx.now,
+                                          fetcher=ctx.openrouter_fetcher,
+                                          endpoints_dir=ctx.endpoints_dir)
+    eps = (snap or {}).get("endpoints", [])
+    if not eps:
+        return None
+    cheapest = min(eps, key=_blended_cost)
+    payload = {"model": model, "slug": slug,
+               "ranked_by": f"blended-{CHEAPEST_IO_RATIO}:1",
+               "provider": cheapest.get("provider_name"),
+               "provider_tag": cheapest.get("provider_tag"),
+               "quantization": cheapest.get("quantization"),
+               "in": cheapest.get("in"), "out": cheapest.get("out"),
+               "source": "openrouter-endpoints", "baseline": True,
+               "authoritative": authoritative, "variants": len(eps),
+               "freshness": ep_freshness}
+    if "in_cache_read" in cheapest:
+        payload["in_cache_read"] = cheapest["in_cache_read"]
+    return ctx.out(payload, ep_freshness, degraded)
+
+
+def _query_cheapest(ctx, model):
+    """`query cheapest` -- cheapest host by blended cost, endpoints then variants."""
+    authoritative = dict(ctx.models[model]) if model in ctx.models else None
+    degraded = bool((authoritative or {}).get("review"))
+
+    code = _cheapest_by_endpoint(ctx, model, authoritative, degraded)
+    if code is not None:
+        return code
+
+    # Fallback: LiteLLM/OpenRouter variant scan for vendor-direct models (FR-004).
+    variants = []
+    if ctx.discovery is not None:
+        for layer_name, layer in ctx.layers():
+            for mid, e in layer.items():
+                if (mid == model or _variant_matches(model, mid)) and "in" in e and "out" in e:
+                    variants.append({"provider": mid, "in": e["in"], "out": e["out"],
+                                     "source": layer_name})
+    if not variants:
+        return ctx.out({"model": model, "found": False, "freshness": ctx.freshness}, "no-data")
+    cheapest = min(variants, key=_blended_cost)
+    return ctx.out({"model": model, "provider": cheapest["provider"], "in": cheapest["in"],
+                    "out": cheapest["out"], "source": cheapest["source"], "baseline": True,
+                    "fallback": True, "authoritative": authoritative,
+                    "ranked_by": f"blended-{CHEAPEST_IO_RATIO}:1",
+                    "variants": len(variants), "freshness": ctx.discovery_freshness},
+                   ctx.discovery_freshness, degraded)
+
+
 def query_main(args, openrouter_fetcher=_default_fetcher, litellm_fetcher=_default_fetcher,
                now=None, cache_path=CACHE_PATH, overrides_path=OVERRIDES_PATH,
                discovery_path=DISCOVERY_PATH, endpoints_dir=ENDPOINTS_CACHE_DIR):
-    """Run a `query` subcommand. Prints JSON to stdout; returns an exit code.
+    """Dispatch a `query` subcommand. Prints JSON to stdout; returns an exit code.
 
     Exit codes (FR-008) follow `_exit_for`, which maps freshness *and*
     degradation. Deliberately not restated here -- see `tests/test_contract_drift.py`.
@@ -781,157 +997,30 @@ def query_main(args, openrouter_fetcher=_default_fetcher, litellm_fetcher=_defau
     model = getattr(args, "model", None)
     ttl_hours = getattr(args, "ttl_hours", None) or DEFAULT_TTL_HOURS
 
-    def _refresh_cache_if_stale(cache):
-        if (cache is None or not is_fresh(cache, ttl_hours, now=now)) and not offline:
-            # A query's --ttl-hours is a read-time gate for *this* caller. Stamping
-            # it into the shared envelope would change every other consumer's
-            # refresh cadence, so the cache keeps its own declared TTL.
-            declared = cache.get("ttl_hours") if isinstance(cache, dict) else None
-            if isinstance(declared, bool) or not isinstance(declared, int) or declared <= 0:
-                declared = DEFAULT_TTL_HOURS
-            # Keep stdout clean for the JSON answer: refresh notes go to stderr.
-            with contextlib.redirect_stdout(sys.stderr):
-                run(ttl_hours=declared, force=True, cache_path=cache_path,
-                    overrides_path=overrides_path, discovery_path=discovery_path,
-                    openrouter_fetcher=openrouter_fetcher, litellm_fetcher=litellm_fetcher,
-                    now=now)
-            return _load_cache(cache_path)
-        return cache
-
-    def _out(payload, freshness, degraded=False):
-        print(json.dumps(dict(payload, degraded=bool(degraded)), sort_keys=True))
-        return _exit_for(freshness, degraded)
-
-    cache = _load_cache(cache_path)
-    cache = _refresh_cache_if_stale(cache)
-    freshness = _freshness_status(cache, ttl_hours, now)
-    cache_models = (cache or {}).get("models", {}) if isinstance(cache, dict) else {}
-    flagged = (cache.get("needs_review") or []) if isinstance(cache, dict) else []
+    cache = _refresh_cache_if_stale(_load_cache(cache_path), offline, ttl_hours, now,
+                                    cache_path, overrides_path, discovery_path,
+                                    openrouter_fetcher, litellm_fetcher)
+    ctx = _QueryContext(cache, _freshness_status(cache, ttl_hours, now), offline,
+                        ttl_hours, now, overrides_path, discovery_path, endpoints_dir,
+                        openrouter_fetcher, litellm_fetcher)
 
     if action == "fresh":
-        fetched_at = cache.get("fetched_at") if isinstance(cache, dict) else None
-        return _out({"freshness": freshness, "fetched_at": fetched_at,
-                     "ttl_hours": ttl_hours, "needs_review": len(flagged)},
-                    freshness, bool(flagged))
-
+        return _query_fresh(ctx)
     if action == "review":
-        if cache is None:
-            return _out({"needs_review": [], "freshness": freshness}, "no-data")
-        declared = load_overrides(overrides_path)
-        rows = []
-        for mid in cache.get("needs_review") or []:
-            entry = cache_models.get(mid) or {}
-            own = declared.get(mid) or {}
-            # An id in needs_review but absent from models can only have been
-            # dropped: nothing could price it, so no entry carries the reason.
-            rows.append({"model": mid,
-                         "reason": entry.get("review", "dropped-unpriceable"),
-                         "declared_in": own.get("in"), "declared_out": own.get("out"),
-                         "serving_in": entry.get("in"), "serving_out": entry.get("out"),
-                         "serving_source": entry.get("source"),
-                         "slug": (entry.get("catalog") or {}).get("slug")})
-        if rows:
-            def _pair(a, b):
-                return f"{a}/{b}" if a is not None else "—"
-            width = max(len(r["model"]) for r in rows)
-            print(f"{'model'.ljust(width)}  {'you declared':>14}  {'now serving':>14}  reason",
-                  file=sys.stderr)
-            for r in rows:
-                print(f"{r['model'].ljust(width)}  "
-                      f"{_pair(r['declared_in'], r['declared_out']):>14}  "
-                      f"{_pair(r['serving_in'], r['serving_out']):>14}  {r['reason']}",
-                      file=sys.stderr)
-        return _out({"needs_review": rows, "freshness": freshness},
-                    freshness, bool(rows))
+        return _query_review(ctx)
 
-    disc = ensure_discovery(offline, ttl_hours, now,
-                            openrouter_fetcher, litellm_fetcher, discovery_path)
-    disc_freshness = ("fresh" if (disc is not None and is_fresh(disc, ttl_hours, now=now))
-                      else ("stale" if disc is not None else "no-data"))
+    # Every remaining action consults discovery; the two above never do.
+    ctx.load_discovery()
 
     if action == "list":
-        models = []
-        for mid, e in cache_models.items():
-            models.append({"model": mid, "in": e.get("in"), "out": e.get("out"),
-                           "source": e.get("source"), "baseline": False})
-        if disc is not None:
-            for layer_name in ("litellm", "openrouter"):
-                for mid, e in (disc.get(layer_name) or {}).items():
-                    if mid in cache_models:
-                        continue
-                    models.append({"model": mid, "in": e.get("in"), "out": e.get("out"),
-                                   "source": layer_name, "baseline": True})
-        status = freshness if freshness != "no-data" else disc_freshness
-        return _out({"freshness": freshness, "models": models}, status, bool(flagged))
-
+        return _query_list(ctx)
     if model is None:
         print(json.dumps({"error": "model argument required for %s" % action}), file=sys.stderr)
         return 2
-
     if action == "price":
-        if model in cache_models:
-            entry = dict(cache_models[model])
-            entry.update({"model": model, "baseline": False, "freshness": freshness})
-            return _out(entry, freshness, bool(entry.get("review")))
-        if disc is not None:
-            # Prefer an exact id match over a provider variant.
-            for layer_name in ("litellm", "openrouter"):
-                layer = disc.get(layer_name) or {}
-                if model in layer:
-                    entry = dict(layer[model])
-                    entry.update({"model": model, "baseline": True, "freshness": disc_freshness})
-                    return _out(entry, disc_freshness)
-            for layer_name in ("litellm", "openrouter"):
-                for mid, e in (disc.get(layer_name) or {}).items():
-                    if _variant_matches(model, mid):
-                        entry = dict(e)
-                        entry.update({"model": mid, "baseline": True, "freshness": disc_freshness})
-                        return _out(entry, disc_freshness)
-        return _out({"model": model, "found": False, "freshness": freshness}, "no-data")
-
+        return _query_price(ctx, model)
     if action == "cheapest":
-        authoritative = dict(cache_models[model]) if model in cache_models else None
-        # US1: OpenRouter per-provider endpoints path (primary).
-        catalog_ids = set((disc or {}).get("openrouter", {}).keys())
-        overrides = load_overrides(overrides_path)
-        slug = _resolve_slug(catalog_ids, model, overrides) if catalog_ids else None
-        if slug is not None:
-            snap, ep_freshness = ensure_endpoints(model, slug, offline, ttl_hours, now,
-                                                  fetcher=openrouter_fetcher,
-                                                  endpoints_dir=endpoints_dir)
-            eps = (snap or {}).get("endpoints", [])
-            if eps:
-                cheapest = min(eps, key=_blended_cost)
-                payload = {"model": model, "slug": slug,
-                           "ranked_by": f"blended-{CHEAPEST_IO_RATIO}:1",
-                           "provider": cheapest.get("provider_name"),
-                           "provider_tag": cheapest.get("provider_tag"),
-                           "quantization": cheapest.get("quantization"),
-                           "in": cheapest.get("in"), "out": cheapest.get("out"),
-                           "source": "openrouter-endpoints", "baseline": True,
-                           "authoritative": authoritative, "variants": len(eps),
-                           "freshness": ep_freshness}
-                if "in_cache_read" in cheapest:
-                    payload["in_cache_read"] = cheapest["in_cache_read"]
-                return _out(payload, ep_freshness,
-                            bool((authoritative or {}).get("review")))
-        # Fallback: LiteLLM/OpenRouter variant scan for vendor-direct models (FR-004).
-        variants = []
-        if disc is not None:
-            for layer_name in ("litellm", "openrouter"):
-                for mid, e in (disc.get(layer_name) or {}).items():
-                    if (mid == model or _variant_matches(model, mid)) and "in" in e and "out" in e:
-                        variants.append({"provider": mid, "in": e["in"], "out": e["out"],
-                                         "source": layer_name})
-        if not variants:
-            return _out({"model": model, "found": False, "freshness": freshness}, "no-data")
-        cheapest = min(variants, key=_blended_cost)
-        return _out({"model": model, "provider": cheapest["provider"], "in": cheapest["in"],
-                     "out": cheapest["out"], "source": cheapest["source"], "baseline": True,
-                     "fallback": True, "authoritative": authoritative,
-                     "ranked_by": f"blended-{CHEAPEST_IO_RATIO}:1",
-                     "variants": len(variants), "freshness": disc_freshness},
-                    disc_freshness, bool((authoritative or {}).get("review")))
+        return _query_cheapest(ctx, model)
 
     print(json.dumps({"error": "unknown action %r" % action}), file=sys.stderr)
     return 2
