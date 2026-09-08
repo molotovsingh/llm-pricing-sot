@@ -7,9 +7,12 @@ cd "$(dirname "$0")"
 # plus smoke of every offline read action. Suppress success noise.
 python3 -m unittest discover -s tests 2>&1 | tail -15
 
-# Offline smoke. Exit-code contract (FR-008): 0 fresh, 1 stale/degraded
-# (the review queue currently flags 4 models, so `list`/`fresh` LEGITIMATELY
-# exit 1), 2 = no data / not found = failure. JSON must always parse.
+# Offline smoke. Exit-code contract (FR-008): 0 fresh, 1 stale/degraded,
+# 2 = no data / not found = failure. JSON must always parse.
+# The review queue is empty: every model either inherits a catalog price or
+# carries an attestation, so `list`/`fresh` exit 0. If one of these starts
+# exiting 1, a price went unattested or a pin stopped resolving — investigate
+# rather than relaxing the expectation back to 1.
 smoke() {  # smoke <expected-0-or-1> <args...>
   local expect="$1"; shift
   local out code
@@ -19,7 +22,7 @@ smoke() {  # smoke <expected-0-or-1> <args...>
   python3 -c 'import json,sys; json.load(sys.stdin)' <<< "$out"
 }
 smoke 0 query price gpt-4o --offline
-smoke 1 query list --offline
-smoke 1 query fresh --offline
+smoke 0 query list --offline
+smoke 0 query fresh --offline
 smoke 0 query cheapest gpt-4o --offline
 echo "checks: suite + offline smoke OK"

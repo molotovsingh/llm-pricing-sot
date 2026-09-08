@@ -91,3 +91,7 @@ Session results (2026-09):
   2–4ms noise floor remains. Further experiments would be noise-mining.
 - Exit-code discovery: `query list`/`fresh` legitimately exit 1 (degraded —
   4 models in the review queue, per FR-008). Not a failure; checks accept it.
+  *Superseded 2026-09-08: those 4 held hand-typed prices predating the
+  attestation rule. Their `in`/`out` were deleted so each inherits from the
+  catalog; the queue is now empty and both commands exit 0. The exit-code
+  contract itself is unchanged — only the data that was tripping it.*

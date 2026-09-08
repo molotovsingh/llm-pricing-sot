@@ -441,11 +441,10 @@ class TestTrustRuleHoldsOperationally(unittest.TestCase):
     def _explode(url):
         raise AssertionError("the suite must never reach the network")
 
-    def test_documented_procedure_matches_degraded_flag(self):
-        cache_path = REPO_ROOT / "cache" / "pricing.json"
-        if not cache_path.exists():
-            self.skipTest("no cache/pricing.json; run fetch_pricing.py first")
-        models = json.loads(cache_path.read_text(encoding="utf-8"))["models"]
+    def _run_procedure(self, cache_path):
+        """Check the documented verdict against `degraded` for every model in a
+        cache envelope. Returns how many `needs_review` entries were exercised."""
+        models = json.loads(pathlib.Path(cache_path).read_text(encoding="utf-8"))["models"]
         self.assertTrue(models, "cache has no models to verify against")
 
         exercised_review = 0
@@ -456,17 +455,44 @@ class TestTrustRuleHoldsOperationally(unittest.TestCase):
             with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
                 fetch_pricing.query_main(args,
                                          openrouter_fetcher=self._explode,
-                                         litellm_fetcher=self._explode)
+                                         litellm_fetcher=self._explode,
+                                         cache_path=str(cache_path))
             answer = json.loads(buf.getvalue())
             documented = bool(entry.get("review"))
             with self.subTest(model=model):
                 self.assertEqual(answer["degraded"], documented)
                 self.assertFalse(answer["baseline"])
             exercised_review += documented
+        return exercised_review
 
-        self.assertGreater(exercised_review, 0,
-                           "no needs_review entry was exercised -- the strongest case "
-                           "for SC-005 went untested")
+    def test_documented_procedure_matches_degraded_flag(self):
+        """SC-005 over the shipped cache: every model, whatever its state."""
+        cache_path = REPO_ROOT / "cache" / "pricing.json"
+        if not cache_path.exists():
+            self.skipTest("no cache/pricing.json; run fetch_pricing.py first")
+        self._run_procedure(cache_path)
+
+    def test_procedure_matches_on_a_needs_review_entry(self):
+        """SC-005's strongest case: an entry sitting in `needs_review`.
+
+        SC-005 says "including entries in needs_review" -- a scope clause, not a
+        requirement that such entries exist. A clean queue is the healthy state
+        (every price either attested or inherited), so this branch is driven by
+        an injected entry rather than by asserting the shipped data stays broken.
+        """
+        cache_path = REPO_ROOT / "cache" / "pricing.json"
+        if not cache_path.exists():
+            self.skipTest("no cache/pricing.json; run fetch_pricing.py first")
+        cache = json.loads(cache_path.read_text(encoding="utf-8"))
+        model = "contract-probe-unattested"
+        cache["models"][model] = {"in": 1.0, "out": 2.0, "source": "openrouter",
+                                  "review": "unattested-price-ignored"}
+        cache["needs_review"] = sorted(set(cache.get("needs_review") or []) | {model})
+        with tempfile.TemporaryDirectory() as d:
+            injected = pathlib.Path(d) / "pricing.json"
+            injected.write_text(json.dumps(cache), encoding="utf-8")
+            self.assertGreater(self._run_procedure(injected), 0,
+                               "the needs_review branch went untested")
 
 
 class TestGenerator(unittest.TestCase):

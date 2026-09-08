@@ -248,10 +248,11 @@ partial write.
 
 ## Open questions
 
-- **The 4 unattested prices.** `gpt-5.2`, `gpt-5.6-sol`, `gpt-5.6-luna` and `deepseek-v4-pro`
-  carry hand-typed prices with no attestation, so the catalog price is being used instead
-  and they sit in `needs_review`. Each needs a decision: attest it (`negotiated` + `note` +
-  `verified_at`) or delete `in`/`out` and let it inherit permanently.
+- ~~**The 4 unattested prices.**~~ *Resolved.* `gpt-5.2`, `gpt-5.6-sol`, `gpt-5.6-luna` and
+  `deepseek-v4-pro` carried hand-typed prices predating the attestation rule, so the catalog
+  price was used instead and they sat permanently in `needs_review`. Their `in`/`out` are
+  now deleted and each inherits from the catalog — the documented default. The review queue
+  is empty; if it fills again, a price went unattested or a pin stopped resolving.
 - **`glm-5.2`'s `verified_at` (2026-08-16) was derived from git history**, not from anyone
   confirming the rate. It should be re-confirmed against the z.ai plan.
 - `ATTESTATION_MAX_AGE_DAYS` is 90 — a guess. Tighten it if rates are renegotiated more often.
