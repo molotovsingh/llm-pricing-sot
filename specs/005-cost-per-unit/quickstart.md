@@ -38,8 +38,9 @@ Derived — self-hosted, priced from a GPU rate and your benchmark:
 Then:
 
 ```bash
-python fetch_pricing.py --force            # re-emit; deployments appear under `deployments`
+python fetch_pricing.py                    # the edit is detected by fingerprint; no --force needed
 python fetch_pricing.py query deployments  # every deployment, price, unit, attestation, review
+python fetch_pricing.py query price deepseek-ai/DeepSeek-OCR   # a deployment-only model answers without --host
 ```
 
 The derived price is `usd_per_hour × seconds_per_unit / 3600`, and the answer names the

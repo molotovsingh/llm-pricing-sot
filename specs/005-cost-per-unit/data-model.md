@@ -138,7 +138,11 @@ Additive, exactly one new key:
 ```
 fetched_at, freshness, models, needs_review, ttl_hours   (existing)
 deployments                                              (new: {id: emitted deployment})
+truth_hash                                               (new: fingerprint of the three truth files at write time;
+                                                          a mismatch on disk is a staleness event)
 ```
+
+Catalog rows and the `catalog` cross-check object carry `fetched_at` — a verifier says its age.
 
 `models[*]` gain `unit: "per_1m_tokens"`; `in`/`out`/`tokenizer`/`source`/`catalog`/
 `drift`/`review` are unchanged. `needs_review` rolls up deployment ids alongside model

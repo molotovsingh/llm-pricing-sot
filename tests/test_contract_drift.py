@@ -458,7 +458,7 @@ class TestFactsDerivedFromCode(unittest.TestCase):
     def test_envelope_matches_build_cache(self):
         self.assertEqual(derive_envelope(),
                          ["deployments", "fetched_at", "freshness", "models",
-                          "needs_review", "ttl_hours"])
+                          "needs_review", "truth_hash", "ttl_hours"])
 
     def test_units_fact_is_derived_from_code(self):
         rendered = render_units()

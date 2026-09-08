@@ -58,7 +58,7 @@ Every consumer reads the **same file**: `<repo>/cache/pricing.json` (repo-local)
 The envelope keys are fixed:
 
 <!-- contract:begin envelope -->
-Cache envelope keys: `deployments`, `fetched_at`, `freshness`, `models`, `needs_review`, `ttl_hours`.
+Cache envelope keys: `deployments`, `fetched_at`, `freshness`, `models`, `needs_review`, `truth_hash`, `ttl_hours`.
 <!-- contract:end envelope -->
 
 **Every price carries a `unit`.** The vocabulary is derived from code, not restated:
@@ -89,7 +89,7 @@ Per-token prices are USD per 1M tokens. A unit's fields are never reused for ano
 
 **Judge staleness** from `freshness` (`fresh` / `stale`), or recompute from `fetched_at` + `ttl_hours`. A cache is stale when `now - fetched_at >= ttl_hours`; missing/unparseable `fetched_at` is treated as stale.
 
-**Auto-refresh rule:** if the cache is missing or stale, run `python fetch_pricing.py [--force] [--ttl-hours H]` then re-read.
+**Auto-refresh rule:** if the cache is missing or stale, run `python fetch_pricing.py [--force] [--ttl-hours H]` then re-read. **An edited truth file is stale too:** `truth_hash` fingerprints `overrides.json`, `deployments.json` and `gpu_rates.json` at write time, and a mismatch triggers a refresh on the next run or online query without waiting for the TTL — so fixing a flagged entry takes effect immediately.
 
 <!-- contract:begin exit-codes -->
 | freshness | degraded | exit |

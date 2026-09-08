@@ -58,6 +58,8 @@ from fetch_pricing import (
     fetch_hf_router,
     host_rows,
     _load_discovery,
+    truth_fingerprint,
+    truth_changed,
 )
 import fetch_pricing as _fp
 
@@ -2106,6 +2108,211 @@ class TestQueryCheapestAtHost(HostQueryBase):
     def test_without_host_the_global_cheapest_is_unchanged(self):
         code, data = self.query("cheapest")
         self.assertEqual((code, data["provider"]), (0, "DeepInfra"))
+
+
+class TestReviewKnowsDeployments(unittest.TestCase):
+    """quality-pass f0c48a7 P1: the work list must name a deployment's own reason."""
+
+    def _rows(self):
+        with tempfile.TemporaryDirectory() as d:
+            cache_path = os.path.join(d, "pricing.json")
+            dep_path = os.path.join(d, "deployments.json")
+            declared = {"ocr@self-host": {"model": "v/OCR", "host": "self-host", "unit": "per_page",
+                                          "derive": {"gpu": "h100@nowhere"}, "note": "n",
+                                          "verified_at": "2026-09-08"}}
+            with open(dep_path, "w", encoding="utf-8") as fh:
+                json.dump(declared, fh)
+            emitted = {"ocr@self-host": {"model": "v/OCR", "host": "self-host", "unit": "per_page",
+                                         "source": "deployment", "baseline": False,
+                                         "attestation": "valid", "review": "gpu-rate-missing"}}
+            models = {"gpt-5.2": {"in": 1.75, "out": 14.0, "tokenizer": "tok", "unit": "per_1m_tokens",
+                                  "source": "openrouter", "review": "unattested-price-ignored",
+                                  "catalog": {"slug": "openai/gpt-5.2"}}}
+            emit(build_cache(models, 24, _now_iso(), "fresh", ["gpt-5.2", "ocr@self-host"], emitted),
+                 cache_path)
+            args = argparse.Namespace(action="review", model=None, offline=True, ttl_hours=24, host=None)
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = query_main(args, cache_path=cache_path, overrides_path=os.path.join(d, "o.json"),
+                                  deployments_path=dep_path)
+            return code, {r["model"]: r for r in json.loads(out.getvalue())["needs_review"]}, err.getvalue()
+
+    def test_deployment_row_carries_its_own_reason_and_unit(self):
+        code, rows, err = self._rows()
+        self.assertEqual(code, 1)
+        dep = rows["ocr@self-host"]
+        self.assertEqual((dep["layer"], dep["reason"], dep["unit"]), ("deployment", "gpu-rate-missing", "per_page"))
+        self.assertEqual(dep["host"], "self-host")
+        self.assertIsNone(dep["serving_in"])  # no price was derived -- and the row says so
+        self.assertIn("ocr@self-host", err)
+
+    def test_model_rows_are_unchanged(self):
+        _, rows, _ = self._rows()
+        m = rows["gpt-5.2"]
+        self.assertEqual((m["layer"], m["reason"], m["slug"]), ("model", "unattested-price-ignored", "openai/gpt-5.2"))
+
+
+class TestPriceFindsDeploymentOnlyModels(HostQueryBase):
+    """quality-pass f0c48a7 P2: a deployment-only model is priceable without --host."""
+
+    def test_single_deployment_is_served(self):
+        self.write_cache({"v/OCR@replicate": {"model": "v/OCR", "host": "replicate", "unit": "per_run",
+                                              "price": 0.014, "source": "deployment", "baseline": False}})
+        code, data = self.query("price", model="v/OCR")
+        self.assertEqual((code, data["price"], data["unit"], data["id"]), (0, 0.014, "per_run", "v/OCR@replicate"))
+
+    def test_several_deployments_name_the_hosts(self):
+        self.write_cache({"v/OCR@replicate": {"model": "v/OCR", "host": "replicate", "unit": "per_run", "price": 0.014},
+                          "v/OCR@self-host": {"model": "v/OCR", "host": "self-host", "unit": "per_page", "price": 0.004}})
+        code, data = self.query("price", model="v/OCR")
+        self.assertEqual(code, 2)
+        self.assertFalse(data["found"])
+        self.assertEqual(sorted(data["hosts"]), ["replicate", "self-host"])
+        self.assertIn("--host", data["hint"])
+
+    def test_tracked_model_still_wins_over_its_deployments(self):
+        code, data = self.query("price")  # glm-5.2 is tracked AND has a deployment
+        self.assertEqual((code, data["source"], data["in"]), (0, "openrouter", 0.966))
+
+
+class TestTruthFingerprint(unittest.TestCase):
+    """quality-pass f0c48a7 P2: an edited truth file is a staleness event."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        d = self.dir.name
+        self.p = {k: os.path.join(d, f"{k}.json") for k in ("cache", "overrides", "deployments", "gpu_rates", "discovery")}
+        with open(self.p["overrides"], "w", encoding="utf-8") as fh:
+            json.dump({"m": {"tokenizer": "tok", "openrouter_slug": "org/m"}}, fh)
+        for k in ("deployments", "gpu_rates"):
+            with open(self.p[k], "w", encoding="utf-8") as fh:
+                json.dump({}, fh)
+        self.catalog = json.dumps({"data": [{"id": "org/m", "pricing": {"prompt": "0.000001", "completion": "0.000002"}}]})
+
+    def _fp(self):
+        return truth_fingerprint(self.p["overrides"], self.p["deployments"], self.p["gpu_rates"])
+
+    def _write_cache(self, truth_hash):
+        emit(build_cache({"m": {"in": 1.0, "out": 2.0, "tokenizer": "tok", "unit": "per_1m_tokens"}},
+                         24, _now_iso(), "fresh", [], {}, truth_hash=truth_hash), self.p["cache"])
+
+    def _run(self, fetcher):
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            return run(cache_path=self.p["cache"], overrides_path=self.p["overrides"],
+                       deployments_path=self.p["deployments"], gpu_rates_path=self.p["gpu_rates"],
+                       openrouter_fetcher=fetcher, litellm_fetcher=lambda u: "{}")
+
+    def test_fingerprint_tracks_every_truth_file(self):
+        before = self._fp()
+        with open(self.p["deployments"], "w", encoding="utf-8") as fh:
+            json.dump({"x@y": {}}, fh)
+        self.assertNotEqual(before, self._fp())
+        os.remove(self.p["gpu_rates"])
+        self.assertEqual(len(self._fp()), 8)  # a missing file still fingerprints
+
+    def test_truth_changed_semantics(self):
+        self.assertFalse(truth_changed({}, "abc"))                  # no record: trusted
+        self.assertFalse(truth_changed({"truth_hash": "abc"}, "abc"))
+        self.assertTrue(truth_changed({"truth_hash": "abc"}, "def"))
+        self.assertFalse(truth_changed(None, "abc"))
+
+    def test_fresh_cache_with_matching_hash_is_a_hit(self):
+        self._write_cache(self._fp())
+
+        def never(url):
+            raise AssertionError("cache hit must not fetch")
+        self.assertEqual(self._run(never), 0)
+
+    def test_fresh_cache_without_a_hash_is_trusted(self):
+        self._write_cache(None)
+
+        def never(url):
+            raise AssertionError("a pre-fingerprint cache must not force a fetch")
+        self.assertEqual(self._run(never), 0)
+
+    def test_edited_truth_file_refreshes_a_fresh_cache(self):
+        self._write_cache(self._fp())
+        with open(self.p["deployments"], "w", encoding="utf-8") as fh:
+            json.dump({"m@together": {"model": "m", "host": "together", "unit": "per_1m_tokens",
+                                      "in": 1.0, "out": 2.0, "note": "n", "verified_at": _now_iso()[:10]}}, fh)
+        calls = []
+
+        def fetcher(url):
+            calls.append(url)
+            return self.catalog
+        self.assertEqual(self._run(fetcher), 0)
+        self.assertTrue(calls, "the edit must trigger the refresh path")
+        with open(self.p["cache"], encoding="utf-8") as fh:
+            cache = json.load(fh)
+        self.assertIn("m@together", cache["deployments"])
+        self.assertEqual(cache["truth_hash"], self._fp())
+
+    def test_query_path_refreshes_on_edit_when_online_and_serves_as_is_offline(self):
+        self._write_cache("stale-hash")
+        calls = []
+
+        def fetcher(url):
+            calls.append(url)
+            return self.catalog
+        for offline, expect_fetch in ((True, False), (False, True)):
+            calls.clear()
+            args = argparse.Namespace(action="fresh", model=None, offline=offline, ttl_hours=24, host=None)
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                query_main(args, cache_path=self.p["cache"], overrides_path=self.p["overrides"],
+                           discovery_path=self.p["discovery"], deployments_path=self.p["deployments"],
+                           gpu_rates_path=self.p["gpu_rates"], openrouter_fetcher=fetcher,
+                           litellm_fetcher=lambda u: "{}")
+            with self.subTest(offline=offline):
+                self.assertEqual(bool(calls), expect_fetch)
+
+
+class TestCatalogRowFreshness(unittest.TestCase):
+    """quality-pass f0c48a7 P3: a verifier says its age, and is refreshed before use."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        d = self.dir.name
+        self.p = {k: os.path.join(d, f"{k}.json") for k in ("cache", "overrides", "deployments", "gpu_rates", "discovery")}
+        self.ep = os.path.join(d, "endpoints")
+        os.makedirs(self.ep)
+        with open(self.p["overrides"], "w", encoding="utf-8") as fh:
+            json.dump({"m": {"tokenizer": "tok", "openrouter_slug": "org/m"}}, fh)
+        with open(self.p["gpu_rates"], "w", encoding="utf-8") as fh:
+            json.dump({}, fh)
+        with open(os.path.join(self.ep, "org__m.json"), "w", encoding="utf-8") as fh:
+            json.dump({"fetched_at": "2020-01-01T00:00:00Z", "slug": "org/m", "endpoints": [
+                {"provider_name": "Together", "in": 9.0, "out": 9.0}]}, fh)
+
+    def test_rows_carry_the_snapshot_age(self):
+        rows = host_rows("m", load_overrides(self.p["overrides"]), self.ep,
+                         {"fetched_at": "2026-09-08T00:00:00Z", "hf_router": {}})
+        self.assertEqual(rows[0]["fetched_at"], "2020-01-01T00:00:00Z")
+        hf_rows = host_rows("m", {"m": {"hf_id": "o/M"}}, self.ep,
+                            {"fetched_at": "2026-09-08T00:00:00Z", "hf_router": {"o/M": {"baseten": {"in": 1, "out": 2}}}})
+        self.assertEqual(hf_rows[0]["fetched_at"], "2026-09-08T00:00:00Z")
+
+    def test_run_refreshes_a_stale_snapshot_before_cross_checking(self):
+        with open(self.p["deployments"], "w", encoding="utf-8") as fh:
+            json.dump({"m@together": {"model": "m", "host": "together", "unit": "per_1m_tokens",
+                                      "in": 1.4, "out": 4.4, "note": "n", "verified_at": _now_iso()[:10]}}, fh)
+        catalog = json.dumps({"data": [{"id": "org/m", "pricing": {"prompt": "0.000001", "completion": "0.000002"}}]})
+        endpoints = json.dumps({"data": {"endpoints": [
+            {"provider_name": "Together", "pricing": {"prompt": "0.0000014", "completion": "0.0000044"}}]}})
+
+        def fetcher(url):
+            return endpoints if "/endpoints" in url else catalog
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            code = run(cache_path=self.p["cache"], overrides_path=self.p["overrides"],
+                       deployments_path=self.p["deployments"], gpu_rates_path=self.p["gpu_rates"],
+                       endpoints_dir=self.ep, openrouter_fetcher=fetcher, litellm_fetcher=lambda u: "{}")
+        self.assertEqual(code, 0)
+        with open(self.p["cache"], encoding="utf-8") as fh:
+            entry = json.load(fh)["deployments"]["m@together"]
+        self.assertEqual((entry["catalog"]["in"], entry["catalog"]["out"]), (1.4, 4.4))  # not 2020's 9/9
+        self.assertNotEqual(entry["catalog"]["fetched_at"], "2020-01-01T00:00:00Z")
+        self.assertNotIn("drift", entry)
 
 
 class TestHostFlagParsing(unittest.TestCase):

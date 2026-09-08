@@ -121,7 +121,7 @@ deterministically, and MUST pin the clock wherever attestation expiry is exercis
 The cache envelope MUST carry exactly these keys:
 
 <!-- contract:begin envelope -->
-Cache envelope keys: `deployments`, `fetched_at`, `freshness`, `models`, `needs_review`, `ttl_hours`.
+Cache envelope keys: `deployments`, `fetched_at`, `freshness`, `models`, `needs_review`, `truth_hash`, `ttl_hours`.
 <!-- contract:end envelope -->
 
 Every price MUST carry a `unit` from this vocabulary, and a unit's price fields

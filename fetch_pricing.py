@@ -509,7 +509,7 @@ def is_fresh(cache, ttl_hours=DEFAULT_TTL_HOURS, now=None):
 
 
 def build_cache(models, ttl_hours, fetched_at, freshness, needs_review=None,
-                deployments=None):
+                deployments=None, truth_hash=None):
     """Build the cache/pricing.json payload (FR-001, FR-006, FR-008).
 
     `needs_review` is a top-level roll-up so a consumer can spot an entry a human
@@ -524,6 +524,8 @@ def build_cache(models, ttl_hours, fetched_at, freshness, needs_review=None,
         "needs_review": sorted(needs_review or []),
         "models": models,
         "deployments": deployments or {},
+        # Fingerprint of the truth files at write time (see truth_fingerprint).
+        "truth_hash": truth_hash,
     }
 
 
@@ -706,7 +708,8 @@ def host_rows(model, overrides, endpoints_dir=ENDPOINTS_CACHE_DIR, discovery=Non
                 continue
             row = {"host": host, "source": "openrouter-endpoints", "baseline": True,
                    "unit": DEFAULT_UNIT, "quantization": e.get("quantization"),
-                   "context_length": e.get("context_length")}
+                   "context_length": e.get("context_length"),
+                   "fetched_at": (snap or {}).get("fetched_at")}  # a verifier says its age
             for f in ("in", "out", "in_cache_read"):
                 if e.get(f) is not None:
                     row[f] = e[f]
@@ -718,7 +721,7 @@ def host_rows(model, overrides, endpoints_dir=ENDPOINTS_CACHE_DIR, discovery=Non
             continue
         row = {"host": canonical_host(host), "source": "hf-router", "baseline": True,
                "unit": DEFAULT_UNIT, "context_length": e.get("context_length"),
-               "status": e.get("status")}
+               "status": e.get("status"), "fetched_at": (discovery or {}).get("fetched_at")}
         for f in ("in", "out"):
             if e.get(f) is not None:
                 row[f] = e[f]
@@ -789,7 +792,8 @@ def resolve_deployments(deployments, gpu_rates, rows_for, now=None):
             out["source"] = catalog["source"]
         if catalog is not None:
             out["catalog"] = {"host": catalog["host"], "in": catalog["in"],
-                              "out": catalog["out"], "source": catalog["source"]}
+                              "out": catalog["out"], "source": catalog["source"],
+                              "fetched_at": catalog.get("fetched_at")}
             if out["source"] == "deployment":
                 drift = {}
                 for f in ("in", "out"):
@@ -800,6 +804,37 @@ def resolve_deployments(deployments, gpu_rates, rows_for, now=None):
                     out["drift"] = drift
         resolved[did] = out
     return resolved
+
+
+def truth_fingerprint(overrides_path=OVERRIDES_PATH, deployments_path=None, gpu_rates_path=None):
+    """A short fingerprint over the three truth files, so a data edit is a staleness event.
+
+    The cache's age says when the *catalogs* were last fetched; it says nothing
+    about whether the hand-held files changed since. Without this, editing a
+    deployment does nothing for up to the TTL. crc32 is change detection, not
+    security, and `zlib` is a builtin that costs nothing on the cold-start path.
+    A missing file hashes as empty so the fingerprint is always computable.
+    """
+    import zlib
+    crc = 0
+    for path in (overrides_path, deployments_path or DEPLOYMENTS_PATH, gpu_rates_path or GPU_RATES_PATH):
+        try:
+            with open(path, "rb") as fh:
+                crc = zlib.crc32(fh.read(), crc)
+        except OSError:
+            crc = zlib.crc32(b"", crc)
+        crc = zlib.crc32(b"\0", crc)
+    return f"{crc & 0xFFFFFFFF:08x}"
+
+
+def truth_changed(cache, fingerprint):
+    """True when the cache records a fingerprint and it differs from the current one.
+
+    A cache written before fingerprints existed carries none and is trusted; only a
+    present, different value means the truth files moved under a fresh cache.
+    """
+    stored = cache.get("truth_hash") if isinstance(cache, dict) else None
+    return stored is not None and stored != fingerprint
 
 
 def run(ttl_hours=DEFAULT_TTL_HOURS, force=False,
@@ -824,18 +859,24 @@ def run(ttl_hours=DEFAULT_TTL_HOURS, force=False,
     deployments_path = deployments_path or DEPLOYMENTS_PATH
     gpu_rates_path = gpu_rates_path or GPU_RATES_PATH
     cache = _load_cache(cache_path)
+    fingerprint = truth_fingerprint(overrides_path, deployments_path, gpu_rates_path)
 
-    # Cache-hit path (FR-002): fresh cache and not forced -> zero network I/O.
+    # Cache-hit path (FR-002): fresh cache, unchanged truth files, not forced ->
+    # zero network I/O. An edited truth file is a staleness event in its own right.
     if cache is not None and not force and is_fresh(cache, ttl_hours, now=now):
-        print(f"cache fresh: served {len(cache.get('models', {}))} models")
-        # Recorded at write time; re-report it, or it stays silent for the whole
-        # TTL window and only the refreshing caller ever hears about it.
-        flagged = cache.get("needs_review") or []
-        if flagged:
-            print(f"warning: {len(flagged)} override(s) need review: "
-                  + ", ".join(sorted(flagged)), file=sys.stderr)
-            return 1
-        return 0
+        if truth_changed(cache, fingerprint):
+            print("note: truth files changed since the cache was written; refreshing",
+                  file=sys.stderr)
+        else:
+            print(f"cache fresh: served {len(cache.get('models', {}))} models")
+            # Recorded at write time; re-report it, or it stays silent for the whole
+            # TTL window and only the refreshing caller ever hears about it.
+            flagged = cache.get("needs_review") or []
+            if flagged:
+                print(f"warning: {len(flagged)} entr{'y' if len(flagged) == 1 else 'ies'} "
+                      f"need review: " + ", ".join(sorted(flagged)), file=sys.stderr)
+                return 1
+            return 0
 
     # Refresh path (FR-003): fetch both sources independently.
     #
@@ -891,16 +932,35 @@ def run(ttl_hours=DEFAULT_TTL_HOURS, force=False,
             # The second truth layer. Cross-checks read the per-host catalogs from
             # this refresh's layers and the endpoint snapshots on disk -- no fetch.
             layers_view = {"openrouter": openrouter_layer or {}, "litellm": litellm_layer or {},
-                           "hf_router": hf_layer or {}}
+                           "hf_router": hf_layer or {}, "fetched_at": _now_iso(now)}
+            declared_deployments = load_deployments(deployments_path)
+            catalog_ids = set(openrouter_layer or {})
+
+            def _slug_for(model):
+                return _resolve_slug(catalog_ids, model, raw_overrides) if catalog_ids else None
+
+            # We are online (the catalog fetch just succeeded): bring the endpoint
+            # snapshot of every per-token deployment's model up to date before it
+            # is used as a verifier, so a deployment is never "checked" against a
+            # row of unknown age. Same refresh `cheapest` performs; same TTL.
+            for dep in declared_deployments.values():
+                if (not isinstance(dep, dict) or "derive" in dep
+                        or dep.get("unit", DEFAULT_UNIT) != DEFAULT_UNIT):
+                    continue
+                slug = _slug_for(dep.get("model"))
+                if slug:
+                    ensure_endpoints(dep["model"], slug, False, ttl_hours, now,
+                                     fetcher=openrouter_fetcher, endpoints_dir=endpoints_dir)
             deployments = resolve_deployments(
-                load_deployments(deployments_path), load_gpu_rates(gpu_rates_path),
-                lambda model: host_rows(model, raw_overrides, endpoints_dir, layers_view),
+                declared_deployments, load_gpu_rates(gpu_rates_path),
+                lambda model: host_rows(model, raw_overrides, endpoints_dir, layers_view,
+                                        _slug_for(model)),
                 now)
             for did, entry in deployments.items():
                 if entry.get("review"):
                     flagged[did] = entry["review"]
             payload = build_cache(valid, ttl_hours, _now_iso(now), "fresh", flagged,
-                                  deployments)
+                                  deployments, truth_hash=fingerprint)
             emit(payload, cache_path)
             if discovery_path:
                 _emit_discovery(discovery_path, _now_iso(now),
@@ -1163,9 +1223,11 @@ class _QueryContext:
 
     def __init__(self, cache, freshness, offline, ttl_hours, now,
                  overrides_path, discovery_path, endpoints_dir,
-                 openrouter_fetcher, litellm_fetcher, hf_fetcher=None, host=None):
+                 openrouter_fetcher, litellm_fetcher, hf_fetcher=None, host=None,
+                 deployments_path=None):
         self.cache = cache
         self.hf_fetcher = hf_fetcher
+        self.deployments_path = deployments_path or DEPLOYMENTS_PATH
         self.host = canonical_host(host) if host else None
         self._overrides = None
         self._host_views = {}
@@ -1247,8 +1309,17 @@ def _refresh_cache_if_stale(cache, offline, ttl_hours, now, cache_path, override
                             discovery_path, openrouter_fetcher, litellm_fetcher,
                             endpoints_dir=ENDPOINTS_CACHE_DIR,
                             deployments_path=None, gpu_rates_path=None, hf_fetcher=None):
-    """Refresh a stale cache before answering, unless offline. Returns the cache."""
-    if offline or (cache is not None and is_fresh(cache, ttl_hours, now=now)):
+    """Refresh a stale cache before answering, unless offline. Returns the cache.
+
+    "Stale" is age *or* an edited truth file: a fresh cache whose recorded
+    `truth_hash` no longer matches the files on disk is refreshed too. Offline,
+    the cache is served as it is either way -- nothing can be resolved without
+    the catalogs.
+    """
+    if offline:
+        return cache
+    fingerprint = truth_fingerprint(overrides_path, deployments_path, gpu_rates_path)
+    if cache is not None and is_fresh(cache, ttl_hours, now=now) and not truth_changed(cache, fingerprint):
         return cache
     # A query's --ttl-hours is a read-time gate for *this* caller. Stamping it
     # into the shared envelope would change every other consumer's refresh
@@ -1280,7 +1351,11 @@ def _print_review_table(rows, stream=None):
     stream = stream or sys.stderr  # resolved at call time, not bound at import
 
     def _pair(a, b):
-        return f"{a}/{b}" if a is not None else "—"
+        # Two-field units render in/out; single-field units (per page, per run)
+        # render the one number.
+        if a is None:
+            return "—"
+        return f"{a}/{b}" if b is not None else f"{a}"
     width = max(len(r["model"]) for r in rows)
     print(f"{'model'.ljust(width)}  {'you declared':>14}  {'now serving':>14}  reason",
           file=stream)
@@ -1296,13 +1371,32 @@ def _query_review(ctx):
     if ctx.cache is None:
         return ctx.out({"needs_review": [], "freshness": ctx.freshness}, "no-data")
     declared = load_overrides(ctx.overrides_path)
+    declared_deployments = load_deployments(ctx.deployments_path)
+    emitted_deployments = ctx.cache.get("deployments") or {}
     rows = []
     for mid in ctx.cache.get("needs_review") or []:
+        if mid in emitted_deployments:
+            # The second truth layer: its own reason, its own unit's fields.
+            entry = emitted_deployments[mid] or {}
+            own = declared_deployments.get(mid) or {}
+            unit = entry.get("unit") or own.get("unit")
+            fields = UNITS.get(unit, {}).get("fields", ())
+            declared_vals = [own.get(f) for f in fields]
+            serving_vals = [entry.get(f) for f in fields]
+            rows.append({"model": mid, "layer": "deployment", "unit": unit,
+                         "reason": entry.get("review", "invalid-deployment"),
+                         "declared_in": declared_vals[0] if declared_vals else None,
+                         "declared_out": declared_vals[1] if len(declared_vals) > 1 else None,
+                         "serving_in": serving_vals[0] if serving_vals else None,
+                         "serving_out": serving_vals[1] if len(serving_vals) > 1 else None,
+                         "serving_source": entry.get("source"), "host": entry.get("host"),
+                         "slug": None})
+            continue
         entry = ctx.models.get(mid) or {}
         own = declared.get(mid) or {}
-        # An id in needs_review but absent from models can only have been
+        # A model id in needs_review but absent from models can only have been
         # dropped: nothing could price it, so no entry carries the reason.
-        rows.append({"model": mid,
+        rows.append({"model": mid, "layer": "model", "unit": DEFAULT_UNIT,
                      "reason": entry.get("review", "dropped-unpriceable"),
                      "declared_in": own.get("in"), "declared_out": own.get("out"),
                      "serving_in": entry.get("in"), "serving_out": entry.get("out"),
@@ -1354,6 +1448,20 @@ def _query_price(ctx, model):
         entry = dict(ctx.models[model])
         entry.update({"model": model, "baseline": False, "freshness": ctx.freshness})
         return ctx.out(entry, ctx.freshness, bool(entry.get("review")))
+    # A model that exists only as a deployment is still priceable without --host:
+    # serve it when there is exactly one, and name the hosts when there are
+    # several so the caller learns what to ask for. Never a bare not-found while
+    # a deployment exists.
+    deployments = ctx.deployments_for(model)
+    if len(deployments) == 1:
+        dep = deployments[0]
+        dep.update({"model": model, "freshness": ctx.freshness})
+        return ctx.out(dep, ctx.freshness, bool(dep.get("review")))
+    if deployments:
+        return ctx.out({"model": model, "found": False, "freshness": ctx.freshness,
+                        "deployments": [d["id"] for d in deployments],
+                        "hosts": [d.get("host") for d in deployments],
+                        "hint": "several deployments; ask with --host <host>"}, "no-data")
     if ctx.discovery is not None:
         # Prefer an exact id match over a provider variant.
         for _, layer in ctx.layers():
@@ -1515,7 +1623,7 @@ def query_main(args, openrouter_fetcher=_default_fetcher, litellm_fetcher=_defau
     ctx = _QueryContext(cache, _freshness_status(cache, ttl_hours, now), offline,
                         ttl_hours, now, overrides_path, discovery_path, endpoints_dir,
                         openrouter_fetcher, litellm_fetcher, hf_fetcher,
-                        host=getattr(args, "host", None))
+                        host=getattr(args, "host", None), deployments_path=deployments_path)
 
     if action == "fresh":
         return _query_fresh(ctx)
