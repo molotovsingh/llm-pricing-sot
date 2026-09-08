@@ -2,7 +2,7 @@
   "_comment": "Layer 1 (truth). DEFAULT: give only a tokenizer (+ openrouter_slug) and let the live catalog price flow through. Hand-type in/out ONLY for a rate we actually pay that the catalog does not list, and attest it with negotiated:true + note + verified_at (ISO date). An unattested price is DISCARDED in favour of the catalog price and reported under needs_review; an attestation older than ATTESTATION_MAX_AGE_DAYS is reported for re-confirmation. To clear a review: either attest the price, or delete in/out so the entry inherits.",
 
   "glm-5.2":         {"tokenizer": "hf:zai-org/GLM-5.2", "fallback": "tiktoken:o200k_base",
-                      "openrouter_slug": "z-ai/glm-5.2",
+                      "openrouter_slug": "z-ai/glm-5.2", "hf_id": "zai-org/GLM-5.2",
                       "in": 0.46, "out": 1.45,
                       "negotiated": true,
                       "note": "z.ai direct rate under a paid plan; OpenRouter lists the public API price.",
@@ -12,10 +12,11 @@
   "gpt-5.6-luna":    {"tokenizer": "tiktoken:o200k_base", "openrouter_slug": "openai/gpt-5.6-luna"},
   "gpt-5.2":         {"tokenizer": "tiktoken:o200k_base", "openrouter_slug": "openai/gpt-5.2"},
   "deepseek-v4-pro": {"tokenizer": "hf:deepseek-ai/DeepSeek-V3", "fallback": "tiktoken:o200k_base",
-                      "openrouter_slug": "deepseek/deepseek-v4-pro"},
+                      "openrouter_slug": "deepseek/deepseek-v4-pro", "hf_id": "deepseek-ai/DeepSeek-V4-Pro"},
 
   "gpt-4o":          {"tokenizer": "tiktoken:o200k_base",   "openrouter_slug": "openai/gpt-4o"},
-  "kimi-k3":         {"tokenizer": "hf:moonshotai/Kimi-K3", "fallback": "tiktoken:o200k_base", "openrouter_slug": "moonshotai/kimi-k3"},
+  "kimi-k3":         {"tokenizer": "hf:moonshotai/Kimi-K3", "fallback": "tiktoken:o200k_base", "openrouter_slug": "moonshotai/kimi-k3",
+                      "hf_id": "moonshotai/Kimi-K3"},
   "claude-sonnet":   {"tokenizer": "tiktoken:cl100k_base",  "openrouter_slug": "anthropic/claude-sonnet-4.6"},
   "claude-haiku":    {"tokenizer": "tiktoken:cl100k_base",  "openrouter_slug": "anthropic/claude-haiku-4.5"}
 }

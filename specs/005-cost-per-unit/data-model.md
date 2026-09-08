@@ -101,6 +101,7 @@ and is never ranked as cheapest per token.
 |---|---|
 | `BaseTen`, `baseten` | `baseten` |
 | `Fireworks`, `fireworks-ai` | `fireworks` |
+| `Featherless`, `featherless-ai` | `featherless` |
 | `Z.AI`, `zai-org`, `z-ai` | `zai` |
 | `Moonshot AI`, `moonshotai` | `moonshot` |
 | `DeepInfra`, `deepinfra` | `deepinfra` |

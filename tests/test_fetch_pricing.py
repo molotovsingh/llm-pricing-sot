@@ -53,6 +53,11 @@ from fetch_pricing import (
     derive_deployment_price,
     resolve_deployments,
     deployment_attestation_state,
+    HF_ROUTER_URL,
+    _normalize_hf_router,
+    fetch_hf_router,
+    host_rows,
+    _load_discovery,
 )
 import fetch_pricing as _fp
 
@@ -1392,6 +1397,13 @@ class TestShippedOverridesFile(unittest.TestCase):
                     self.assertRegex(entry["fallback"], self.SPEC)
                     self.assertNotEqual(entry["fallback"], entry["tokenizer"])
 
+    def test_hf_ids_are_org_slash_name(self):
+        # `hf_id` maps a model onto the Hugging Face router layer (spec 005, US3).
+        for mid, entry in self.entries.items():
+            if "hf_id" in entry:
+                with self.subTest(model=mid):
+                    self.assertRegex(entry["hf_id"], r"^[^/\s]+/[^/\s]+$")
+
     def test_pins_are_author_slug_shaped(self):
         for mid, entry in self.entries.items():
             if "openrouter_slug" in entry:
@@ -1457,6 +1469,7 @@ class TestCanonicalHost(unittest.TestCase):
     def test_declared_forms_collapse(self):
         cases = [(("BaseTen", "baseten"), "baseten"),
                  (("Fireworks", "fireworks-ai"), "fireworks"),
+                 (("Featherless", "featherless-ai"), "featherless"),
                  (("Z.AI", "zai-org", "z-ai"), "zai"),
                  (("Moonshot AI", "moonshotai"), "moonshot"),
                  (("DeepInfra", "deepinfra"), "deepinfra"),
@@ -1784,3 +1797,151 @@ class TestShippedDeploymentsFile(unittest.TestCase):
             with self.subTest(entry=did):
                 on_date = _parse_iso_utc(entry["verified_at"]) + timedelta(days=1)
                 self.assertEqual(deployment_attestation_state(entry, now=on_date), "valid")
+
+
+# ---------------- spec 005 US3: the Hugging Face router, a demoted catalog ----------------
+
+HF_FIXTURE = {"data": [
+    {"id": "moonshotai/Kimi-K3", "providers": [
+        {"provider": "together", "status": "live", "context_length": 1048576,
+         "pricing": {"input": 3, "output": 15}},
+        {"provider": "baseten", "status": "live", "context_length": 1048576,
+         "pricing": {"input": 3.0, "output": 15.0}},
+        {"provider": "featherless-ai", "status": "live"}]},               # flat-rate: no price
+    {"id": "zai-org/GLM-5.2", "providers": [
+        {"provider": "fireworks-ai", "status": "live", "pricing": {"input": 1.4, "output": 4.4}},
+        {"provider": "zai-org", "status": "error"}]},
+    "not-a-dict", {"providers": []}, {"id": "junk/x", "providers": "nope"},
+]}
+
+
+class TestHfRouterNormaliser(unittest.TestCase):
+    def test_keeps_priced_and_priceless_hosts(self):
+        layer = _normalize_hf_router(HF_FIXTURE)
+        kimi = layer["moonshotai/Kimi-K3"]
+        self.assertEqual(kimi["together"],
+                         {"status": "live", "context_length": 1048576, "in": 3.0, "out": 15.0})
+        self.assertEqual(kimi["featherless"], {"status": "live"})  # listed, never ranked
+        self.assertNotIn("in", kimi["featherless"])
+
+    def test_canonicalises_host_names(self):
+        glm = _normalize_hf_router(HF_FIXTURE)["zai-org/GLM-5.2"]
+        self.assertIn("fireworks", glm)
+        self.assertEqual(glm["zai"]["status"], "error")
+
+    def test_tolerates_junk(self):
+        layer = _normalize_hf_router(HF_FIXTURE)
+        self.assertEqual(set(layer), {"moonshotai/Kimi-K3", "zai-org/GLM-5.2"})
+        self.assertEqual(_normalize_hf_router("garbage"), {})
+        self.assertEqual(_normalize_hf_router({"data": [{"id": "a/b", "providers": [
+            {"provider": "x", "pricing": {"input": True, "output": -1}}]}]}),
+            {"a/b": {"x": {"status": None}}})
+
+    def test_fetch_uses_the_injected_fetcher(self):
+        seen = []
+
+        def fetcher(url):
+            seen.append(url)
+            return json.dumps(HF_FIXTURE)
+        layer = fetch_hf_router(fetcher=fetcher)
+        self.assertEqual(seen, [HF_ROUTER_URL])
+        self.assertIn("moonshotai/Kimi-K3", layer)
+
+
+class TestHfRouterInRun(unittest.TestCase):
+    """Demoted-source semantics, mirrored from the LiteLLM outage tests."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.paths = {k: os.path.join(self.dir.name, f"{k}.json")
+                      for k in ("cache", "discovery", "overrides", "deployments", "gpu_rates")}
+        self.endpoints_dir = os.path.join(self.dir.name, "endpoints")
+        with open(self.paths["overrides"], "w", encoding="utf-8") as fh:
+            json.dump({"kimi-k3": {"tokenizer": "tok", "openrouter_slug": "moonshotai/kimi-k3",
+                                   "hf_id": "moonshotai/Kimi-K3"}}, fh)
+        self.openrouter = json.dumps({"data": [{"id": "moonshotai/kimi-k3", "pricing":
+                                                {"prompt": "0.000003", "completion": "0.000015"}}]})
+
+    def _run(self, hf_fetcher=None, deployments=None):
+        with open(self.paths["deployments"], "w", encoding="utf-8") as fh:
+            json.dump(deployments or {}, fh)
+        with open(self.paths["gpu_rates"], "w", encoding="utf-8") as fh:
+            json.dump({}, fh)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = run(cache_path=self.paths["cache"], overrides_path=self.paths["overrides"],
+                       discovery_path=self.paths["discovery"], endpoints_dir=self.endpoints_dir,
+                       deployments_path=self.paths["deployments"],
+                       gpu_rates_path=self.paths["gpu_rates"],
+                       openrouter_fetcher=lambda u: self.openrouter,
+                       litellm_fetcher=lambda u: "{}", hf_fetcher=hf_fetcher)
+        with open(self.paths["cache"], encoding="utf-8") as fh:
+            cache = json.load(fh)
+        return code, cache, _load_discovery(self.paths["discovery"]), err.getvalue()
+
+    @staticmethod
+    def _down(url):
+        raise OSError("source unavailable")
+
+    def test_layer_is_persisted_in_discovery(self):
+        code, _, disc, _ = self._run(hf_fetcher=lambda u: json.dumps(HF_FIXTURE))
+        self.assertEqual(code, 0)
+        self.assertEqual(disc["hf_router"]["moonshotai/Kimi-K3"]["together"]["in"], 3.0)
+
+    def test_outage_reuses_last_layer_and_refresh_succeeds(self):
+        with open(self.paths["discovery"], "w", encoding="utf-8") as fh:
+            json.dump({"fetched_at": _now_iso(), "openrouter": {}, "litellm": {},
+                       "hf_router": {"legacy/M": {"together": {"in": 1.0, "out": 2.0}}}}, fh)
+        code, _, disc, err = self._run(hf_fetcher=self._down)
+        self.assertEqual(code, 0)
+        self.assertIn("legacy/M", disc["hf_router"])
+        self.assertIn("hf router unavailable", err)
+
+    def test_no_fetcher_means_no_fetch_and_the_layer_is_kept(self):
+        with open(self.paths["discovery"], "w", encoding="utf-8") as fh:
+            json.dump({"fetched_at": _now_iso(), "openrouter": {}, "litellm": {},
+                       "hf_router": {"legacy/M": {}}}, fh)
+        code, _, disc, err = self._run(hf_fetcher=None)
+        self.assertEqual(code, 0)
+        self.assertIn("legacy/M", disc["hf_router"])
+        self.assertNotIn("hf router", err)
+
+    def test_older_discovery_without_the_layer_still_loads(self):
+        with open(self.paths["discovery"], "w", encoding="utf-8") as fh:
+            json.dump({"fetched_at": _now_iso(), "openrouter": {}, "litellm": {}}, fh)
+        self.assertIsNotNone(_load_discovery(self.paths["discovery"]))
+        code, _, disc, _ = self._run(hf_fetcher=lambda u: json.dumps(HF_FIXTURE))
+        self.assertEqual(code, 0)
+        self.assertIn("hf_router", disc)
+
+    def test_host_rows_merge_both_catalogs_cheapest_first(self):
+        os.makedirs(self.endpoints_dir)
+        with open(os.path.join(self.endpoints_dir, "moonshotai__kimi-k3.json"), "w",
+                  encoding="utf-8") as fh:
+            json.dump({"fetched_at": _now_iso(), "slug": "moonshotai/kimi-k3", "endpoints": [
+                {"provider_name": "BaseTen", "quantization": "fp8", "in": 3.0, "out": 15.0},
+                {"provider_name": "DeepInfra", "quantization": "bf16", "in": 2.85, "out": 14.25}]}, fh)
+        overrides = load_overrides(self.paths["overrides"])
+        disc = {"hf_router": _normalize_hf_router(HF_FIXTURE)}
+        rows = host_rows("kimi-k3", overrides, self.endpoints_dir, disc)
+        by_host = {}
+        for r in rows:
+            by_host.setdefault(r["host"], []).append(r["source"])
+        self.assertEqual(by_host["baseten"], ["openrouter-endpoints", "hf-router"])
+        self.assertEqual(by_host["together"], ["hf-router"])
+        self.assertEqual(rows[0]["host"], "deepinfra")           # cheapest first
+        self.assertEqual(rows[-1]["host"], "featherless")        # priceless last
+        self.assertNotIn("in", rows[-1])
+        self.assertTrue(all(r["baseline"] and r["unit"] == DEFAULT_UNIT for r in rows))
+
+    def test_deployment_cross_check_can_come_from_the_hf_layer(self):
+        # US2 meets US3: no endpoint snapshot on disk, so the only Together row is HF's.
+        dep = {"kimi-k3@together": {"model": "kimi-k3", "host": "together", "unit": "per_1m_tokens",
+                                    "in": 3.0, "out": 15.0, "note": "together.ai/pricing",
+                                    "verified_at": _now_iso()[:10]}}
+        code, cache, _, _ = self._run(hf_fetcher=lambda u: json.dumps(HF_FIXTURE), deployments=dep)
+        self.assertEqual(code, 0)
+        entry = cache["deployments"]["kimi-k3@together"]
+        self.assertEqual(entry["catalog"]["source"], "hf-router")
+        self.assertNotIn("drift", entry)

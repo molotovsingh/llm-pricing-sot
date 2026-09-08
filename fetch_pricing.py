@@ -68,6 +68,9 @@ OPENROUTER_ENDPOINTS_URL = "https://openrouter.ai/api/v1/models/{slug}/endpoints
 
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 LITELLM_PRICES_URL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
+# Public, unauthenticated, documented (huggingface.co/docs/inference-providers/hub-api):
+# per-provider prices in USD per 1M tokens for every chat model HF routes.
+HF_ROUTER_URL = "https://router.huggingface.co/v1/models"
 
 
 def parse_args(argv=None):
@@ -214,6 +217,48 @@ def fetch_openrouter(url=OPENROUTER_MODELS_URL, fetcher=_default_fetcher):
 def fetch_litellm(url=LITELLM_PRICES_URL, fetcher=_default_fetcher):
     """Fetch and normalize LiteLLM prices (FR-003, NFR-002)."""
     return _normalize_litellm(_fetch_json(url, fetcher))
+
+
+def _normalize_hf_router(data):
+    """Tolerant extraction of the Hugging Face router's per-provider prices.
+
+    Documented shape: {"data": [{"id": "org/Model", "providers": [{"provider",
+    "status", "context_length", "pricing": {"input", "output"}, ...}]}]}, with
+    prices already in USD per 1M tokens. A provider with no `pricing` (Featherless
+    is flat-rate) is kept with its status so `hosts` can list it, and is never
+    ranked. Host names are canonicalised at read time so the two catalogs agree
+    on who is who. Result: {hf_id: {host: {in, out, context_length, status}}}.
+    """
+    layer = {}
+    items = data.get("data", []) if isinstance(data, dict) else []
+    for item in items:
+        if not isinstance(item, dict) or not item.get("id"):
+            continue
+        providers = item.get("providers")
+        hosts = {}
+        for p in providers if isinstance(providers, list) else []:
+            if not isinstance(p, dict):
+                continue
+            host = canonical_host(p.get("provider"))
+            if not host:
+                continue
+            row = {"status": p.get("status")}
+            if p.get("context_length") is not None:
+                row["context_length"] = p["context_length"]
+            pricing = p.get("pricing") or {}
+            for src, dst in (("input", "in"), ("output", "out")):
+                value = pricing.get(src) if isinstance(pricing, dict) else None
+                if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+                    row[dst] = round(float(value), 6)
+            hosts[host] = row
+        if hosts:
+            layer[item["id"]] = hosts
+    return layer
+
+
+def fetch_hf_router(url=HF_ROUTER_URL, fetcher=_default_fetcher):
+    """Fetch and normalize the Hugging Face router model list (spec 005, US3)."""
+    return _normalize_hf_router(_fetch_json(url, fetcher))
 
 
 def merge(layers):
@@ -542,6 +587,7 @@ GPU_RATES_PATH = os.path.join(_SCRIPT_DIR, "gpu_rates.json")
 # the failure _resolve_slug was fixed for. Unknown names stay distinct.
 HOST_ALIASES = {
     "fireworksai": "fireworks",
+    "featherlessai": "featherless",
     "zaiorg": "zai",
     "moonshotai": "moonshot",
     "selfhost": "self-host",
@@ -754,6 +800,7 @@ def run(ttl_hours=DEFAULT_TTL_HOURS, force=False,
         cache_path=CACHE_PATH, overrides_path=OVERRIDES_PATH,
         discovery_path=None,
         openrouter_url=OPENROUTER_MODELS_URL, litellm_url=LITELLM_PRICES_URL,
+        hf_url=HF_ROUTER_URL, hf_fetcher=None,
         openrouter_fetcher=_default_fetcher, litellm_fetcher=_default_fetcher,
         now=None, endpoints_dir=ENDPOINTS_CACHE_DIR,
         deployments_path=None, gpu_rates_path=None):
@@ -800,6 +847,19 @@ def run(ttl_hours=DEFAULT_TTL_HOURS, force=False,
         litellm_layer = _last_known_layer(discovery_path, "litellm")
         reused = f"reusing {len(litellm_layer)} cached entries" if litellm_layer else "no cached layer"
         print(f"warning: litellm unavailable; {reused}", file=sys.stderr)
+    # The Hugging Face router is a demoted per-host catalog, like LiteLLM. It is
+    # fetched only when a fetcher is supplied -- the CLI passes one; a caller
+    # that supplies none reuses the last known layer. That keeps a hermetic
+    # caller's network guard from being swallowed into the fallback path.
+    if hf_fetcher is None:
+        hf_layer = _last_known_layer(discovery_path, "hf_router")
+    else:
+        try:
+            hf_layer = fetch_hf_router(hf_url, hf_fetcher)
+        except Exception:
+            hf_layer = _last_known_layer(discovery_path, "hf_router")
+            reused = f"reusing {len(hf_layer)} cached entries" if hf_layer else "no cached layer"
+            print(f"warning: hf router unavailable; {reused}", file=sys.stderr)
     catalog_unavailable = openrouter_layer is None
 
     raw_overrides = load_overrides(overrides_path)
@@ -824,7 +884,8 @@ def run(ttl_hours=DEFAULT_TTL_HOURS, force=False,
                 flagged[mid] = "dropped-unpriceable"
             # The second truth layer. Cross-checks read the per-host catalogs from
             # this refresh's layers and the endpoint snapshots on disk -- no fetch.
-            layers_view = {"openrouter": openrouter_layer or {}, "litellm": litellm_layer or {}}
+            layers_view = {"openrouter": openrouter_layer or {}, "litellm": litellm_layer or {},
+                           "hf_router": hf_layer or {}}
             deployments = resolve_deployments(
                 load_deployments(deployments_path), load_gpu_rates(gpu_rates_path),
                 lambda model: host_rows(model, raw_overrides, endpoints_dir, layers_view),
@@ -837,7 +898,8 @@ def run(ttl_hours=DEFAULT_TTL_HOURS, force=False,
             emit(payload, cache_path)
             if discovery_path:
                 _emit_discovery(discovery_path, _now_iso(now),
-                                openrouter_layer or {}, litellm_layer or {}, ttl_hours)
+                                openrouter_layer or {}, litellm_layer or {}, ttl_hours,
+                                hf_layer or {})
             print(f"fetched fresh: {len(valid)} models")
             if flagged:
                 # Exit 1 ("served, but degraded") so a consumer that already
@@ -870,14 +932,19 @@ def run(ttl_hours=DEFAULT_TTL_HOURS, force=False,
 # ---------------- query interface ----------------
 
 def _emit_discovery(path, fetched_at, openrouter_layer, litellm_layer,
-                    ttl_hours=DEFAULT_TTL_HOURS):
-    """Persist normalized discovery layers so fallback queries stay TTL-gated."""
+                    ttl_hours=DEFAULT_TTL_HOURS, hf_router_layer=None):
+    """Persist normalized discovery layers so fallback queries stay TTL-gated.
+
+    `hf_router` is additive: `_load_discovery` tolerates its absence so a
+    sidecar written before spec 005 still loads.
+    """
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     payload = {
         "fetched_at": fetched_at,
         "ttl_hours": ttl_hours,
         "openrouter": openrouter_layer or {},
         "litellm": litellm_layer or {},
+        "hf_router": hf_router_layer or {},
     }
     _write_json_atomic(path, payload, sort_keys=True)
 
@@ -898,10 +965,12 @@ def _load_discovery(path=DISCOVERY_PATH):
 
 def ensure_discovery(offline, ttl_hours=DEFAULT_TTL_HOURS, now=None,
                      openrouter_fetcher=_default_fetcher, litellm_fetcher=_default_fetcher,
-                     path=DISCOVERY_PATH):
+                     path=DISCOVERY_PATH, hf_fetcher=None):
     """Return the discovery sidecar, refreshing it when stale unless offline.
 
     Offline (or a failed fetch) returns the existing sidecar as-is, possibly None.
+    The Hugging Face layer is demoted and opt-in: fetched only when `hf_fetcher`
+    is supplied, and on failure the sidecar's last known layer is kept.
     """
     disc = _load_discovery(path)
     if disc is not None and is_fresh(disc, ttl_hours, now=now):
@@ -918,7 +987,13 @@ def ensure_discovery(offline, ttl_hours=DEFAULT_TTL_HOURS, now=None,
         litellm_layer = None
     if openrouter_layer is None and litellm_layer is None:
         return disc
-    _emit_discovery(path, _now_iso(now), openrouter_layer, litellm_layer, ttl_hours)
+    hf_layer = (disc or {}).get("hf_router")
+    if hf_fetcher is not None:
+        try:
+            hf_layer = fetch_hf_router(HF_ROUTER_URL, hf_fetcher)
+        except Exception:
+            pass  # demoted: the last known layer stands
+    _emit_discovery(path, _now_iso(now), openrouter_layer, litellm_layer, ttl_hours, hf_layer)
     return _load_discovery(path)
 
 
@@ -1082,8 +1157,9 @@ class _QueryContext:
 
     def __init__(self, cache, freshness, offline, ttl_hours, now,
                  overrides_path, discovery_path, endpoints_dir,
-                 openrouter_fetcher, litellm_fetcher):
+                 openrouter_fetcher, litellm_fetcher, hf_fetcher=None):
         self.cache = cache
+        self.hf_fetcher = hf_fetcher
         self.freshness = freshness
         self.offline = offline
         self.ttl_hours = ttl_hours
@@ -1102,7 +1178,7 @@ class _QueryContext:
         """Load (or refresh) the discovery layer and record its freshness."""
         self.discovery = ensure_discovery(self.offline, self.ttl_hours, self.now,
                                           self.openrouter_fetcher, self.litellm_fetcher,
-                                          self.discovery_path)
+                                          self.discovery_path, hf_fetcher=self.hf_fetcher)
         if self.discovery is None:
             self.discovery_freshness = "no-data"
         else:
@@ -1125,7 +1201,7 @@ class _QueryContext:
 def _refresh_cache_if_stale(cache, offline, ttl_hours, now, cache_path, overrides_path,
                             discovery_path, openrouter_fetcher, litellm_fetcher,
                             endpoints_dir=ENDPOINTS_CACHE_DIR,
-                            deployments_path=None, gpu_rates_path=None):
+                            deployments_path=None, gpu_rates_path=None, hf_fetcher=None):
     """Refresh a stale cache before answering, unless offline. Returns the cache."""
     if offline or (cache is not None and is_fresh(cache, ttl_hours, now=now)):
         return cache
@@ -1141,7 +1217,8 @@ def _refresh_cache_if_stale(cache, offline, ttl_hours, now, cache_path, override
             overrides_path=overrides_path, discovery_path=discovery_path,
             openrouter_fetcher=openrouter_fetcher, litellm_fetcher=litellm_fetcher,
             now=now, endpoints_dir=endpoints_dir,
-            deployments_path=deployments_path, gpu_rates_path=gpu_rates_path)
+            deployments_path=deployments_path, gpu_rates_path=gpu_rates_path,
+            hf_fetcher=hf_fetcher)
     return _load_cache(cache_path)
 
 
@@ -1327,7 +1404,7 @@ def _query_deployments(ctx):
 def query_main(args, openrouter_fetcher=_default_fetcher, litellm_fetcher=_default_fetcher,
                now=None, cache_path=CACHE_PATH, overrides_path=OVERRIDES_PATH,
                discovery_path=DISCOVERY_PATH, endpoints_dir=ENDPOINTS_CACHE_DIR,
-               deployments_path=None, gpu_rates_path=None):
+               deployments_path=None, gpu_rates_path=None, hf_fetcher=None):
     """Dispatch a `query` subcommand. Prints JSON to stdout; returns an exit code.
 
     Exit codes (FR-008) follow `_exit_for`, which maps freshness *and*
@@ -1341,10 +1418,10 @@ def query_main(args, openrouter_fetcher=_default_fetcher, litellm_fetcher=_defau
     cache = _refresh_cache_if_stale(_load_cache(cache_path), offline, ttl_hours, now,
                                     cache_path, overrides_path, discovery_path,
                                     openrouter_fetcher, litellm_fetcher, endpoints_dir,
-                                    deployments_path, gpu_rates_path)
+                                    deployments_path, gpu_rates_path, hf_fetcher)
     ctx = _QueryContext(cache, _freshness_status(cache, ttl_hours, now), offline,
                         ttl_hours, now, overrides_path, discovery_path, endpoints_dir,
-                        openrouter_fetcher, litellm_fetcher)
+                        openrouter_fetcher, litellm_fetcher, hf_fetcher)
 
     if action == "fresh":
         return _query_fresh(ctx)
@@ -1373,10 +1450,11 @@ def query_main(args, openrouter_fetcher=_default_fetcher, litellm_fetcher=_defau
 def main(argv=None):
     """CLI entrypoint (pipeline run, or `query` subcommands)."""
     args = parse_args(argv)
+    # The CLI is the one caller that always wants the demoted HF layer fetched.
     if getattr(args, "command", None) == "query":
-        return query_main(args)
+        return query_main(args, hf_fetcher=_default_fetcher)
     return run(ttl_hours=args.ttl_hours, force=args.force,
-               discovery_path=DISCOVERY_PATH)
+               discovery_path=DISCOVERY_PATH, hf_fetcher=_default_fetcher)
 
 
 if __name__ == "__main__":
