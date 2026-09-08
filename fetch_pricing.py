@@ -91,8 +91,10 @@ def parse_args(argv=None):
         help="Override the freshness TTL in hours (default: %(default)s).",
     )
     sub = parser.add_subparsers(dest="command")
-    q = sub.add_parser("query", help="run pricing queries (price, cheapest, list, fresh)")
-    q.add_argument("action", choices=["price", "cheapest", "list", "fresh", "review"],
+    q = sub.add_parser("query", help="run pricing queries (price, cheapest, list, fresh, "
+                                     "review, deployments)")
+    q.add_argument("action", choices=["price", "cheapest", "list", "fresh", "review",
+                                      "deployments"],
                    help="query action")
     q.add_argument("model", nargs="?", default=None, help="model id (for price/cheapest)")
     q.add_argument(
@@ -259,6 +261,17 @@ def attestation_state(entry, now=None):
     """
     if entry.get("negotiated") is not True:
         return "missing"
+    return _note_and_date_state(entry, now)
+
+
+def _note_and_date_state(entry, now=None):
+    """valid / expired / missing, judged from `note` + `verified_at` alone.
+
+    The claim half of every attestation in the repo -- overrides add `negotiated`
+    on top; deployments and GPU rates use exactly this. A future-dated or
+    unparseable `verified_at` is missing, not valid: a date nobody could have
+    written on purpose is not a claim.
+    """
     note = entry.get("note")
     if not isinstance(note, str) or not note.strip():
         return "missing"
@@ -518,12 +531,232 @@ def _now_iso(now=None):
     return now.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# ---------------- deployments: what we actually run ----------------
+
+DEPLOYMENTS_PATH = os.path.join(_SCRIPT_DIR, "deployments.json")
+GPU_RATES_PATH = os.path.join(_SCRIPT_DIR, "gpu_rates.json")
+
+# The same host is named differently by different catalogs (`BaseTen` / `baseten`,
+# `Fireworks` / `fireworks-ai`, `Z.AI` / `zai-org` / `z-ai`). Aliases are declared,
+# never inferred: a fuzzy merge would silently price one host as another, which is
+# the failure _resolve_slug was fixed for. Unknown names stay distinct.
+HOST_ALIASES = {
+    "fireworksai": "fireworks",
+    "zaiorg": "zai",
+    "moonshotai": "moonshot",
+    "selfhost": "self-host",
+}
+
+
+def canonical_host(name):
+    """Canonical host id: lowercase, alphanumerics only, then declared aliases."""
+    if not isinstance(name, str):
+        return None
+    key = re.sub(r"[^a-z0-9]", "", name.lower())
+    return HOST_ALIASES.get(key, key) or None
+
+
+def _load_truth_file(path):
+    """Load a hand-held JSON object; `_`-prefixed keys are documentation."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {k: v for k, v in data.items() if not k.startswith("_")}
+
+
+def load_deployments(path=DEPLOYMENTS_PATH):
+    """deployments.json: what we actually run, each in its native unit."""
+    return _load_truth_file(path)
+
+
+def load_gpu_rates(path=GPU_RATES_PATH):
+    """gpu_rates.json: attested USD per hour, keyed <gpu>@<provider>."""
+    return _load_truth_file(path)
+
+
+deployment_attestation_state = _note_and_date_state
+
+
+def validate_deployment(entry):
+    """True if a deployments.json entry has a usable shape (spec 005 data-model).
+
+    Quoted entries carry exactly their unit's price fields. Derived entries carry
+    a `derive` block naming a GPU rate, no price fields, and a single-field unit:
+    a seconds-per-unit measurement yields one number, and `per_1m_tokens` needs
+    two. `per_month` cannot be derived from GPU time at all.
+    """
+    if not isinstance(entry, dict):
+        return False
+    if not all(isinstance(entry.get(k), str) and entry[k] for k in ("model", "host")):
+        return False
+    spec = UNITS.get(entry.get("unit"))
+    if spec is None:
+        return False
+    derive = entry.get("derive")
+    has_price = any(f in entry for f in _ALL_PRICE_FIELDS)
+    if derive is not None:
+        if not isinstance(derive, dict) or has_price:
+            return False
+        gpu = derive.get("gpu")
+        return (len(spec["fields"]) == 1 and entry["unit"] != "per_month"
+                and isinstance(gpu, str) and bool(gpu))
+    return _unit_fields_valid(entry, entry["unit"])
+
+
+def derive_deployment_price(entry, gpu_rates, now=None):
+    """Price a self-hosted deployment from an attested GPU rate and a measurement.
+
+    Returns (review_reason_or_None, fields). `fields` is empty when an input is
+    missing -- a derived price is never guessed. Otherwise it holds the unit's
+    price field (usd_per_hour * seconds_per_unit / 3600) and `rate`, naming
+    exactly which USD/hour was used, so the answer carries its own provenance.
+    """
+    derive = entry.get("derive") or {}
+    key = derive.get("gpu")
+    rate = gpu_rates.get(key) if isinstance(key, str) else None
+    if not isinstance(rate, dict) or not _is_non_negative_num(rate.get("usd_per_hour")):
+        return "gpu-rate-missing", {}
+    spu = derive.get("seconds_per_unit")
+    if isinstance(spu, bool) or not isinstance(spu, (int, float)) or spu <= 0:
+        return "bench-missing", {}
+    field = UNITS[entry["unit"]]["fields"][0]
+    fields = {field: round(rate["usd_per_hour"] * spu / 3600, 8),
+              "rate": {"key": key, "usd_per_hour": rate["usd_per_hour"],
+                       "provider": rate.get("provider")}}
+    state = _note_and_date_state(rate, now)
+    reason = {"expired": "gpu-rate-expired", "missing": "gpu-rate-unattested"}.get(state)
+    return reason, fields
+
+
+def host_rows(model, overrides, endpoints_dir=ENDPOINTS_CACHE_DIR, discovery=None):
+    """Every (host, sku) price for a model from the per-host catalogs (spec 005, US4).
+
+    Rows come from the OpenRouter endpoint snapshot for the model's pinned slug
+    and, when the model declares `hf_id`, from the Hugging Face router layer of
+    the discovery sidecar. Host names are canonicalised so the two catalogs agree
+    on who is who. Rows are catalog data -- `baseline: true`, verifiers rather
+    than truth -- sorted cheapest first by blended cost; a row with no per-token
+    price sorts last and is never ranked.
+    """
+    rows = []
+    entry = (overrides or {}).get(model)
+    entry = entry if isinstance(entry, dict) else {}
+    slug = entry.get("openrouter_slug")
+    if slug:
+        snap = _load_endpoint_snapshot(_endpoint_snapshot_path(slug, endpoints_dir))
+        for e in (snap or {}).get("endpoints", []):
+            host = canonical_host(e.get("provider_name"))
+            if not host:
+                continue
+            row = {"host": host, "source": "openrouter-endpoints", "baseline": True,
+                   "unit": DEFAULT_UNIT, "quantization": e.get("quantization"),
+                   "context_length": e.get("context_length")}
+            for f in ("in", "out", "in_cache_read"):
+                if e.get(f) is not None:
+                    row[f] = e[f]
+            rows.append(row)
+    hf_id = entry.get("hf_id")
+    hf_layer = ((discovery or {}).get("hf_router") or {}).get(hf_id) if hf_id else None
+    for host, e in (hf_layer or {}).items():
+        if not isinstance(e, dict):
+            continue
+        row = {"host": canonical_host(host), "source": "hf-router", "baseline": True,
+               "unit": DEFAULT_UNIT, "context_length": e.get("context_length"),
+               "status": e.get("status")}
+        for f in ("in", "out"):
+            if e.get(f) is not None:
+                row[f] = e[f]
+        rows.append(row)
+    rows.sort(key=_blended_cost)
+    return rows
+
+
+def _catalog_row_at_host(rows, host):
+    """Cheapest *priced* catalog row at a host, or None. Rows arrive cheapest-first."""
+    want = canonical_host(host)
+    for row in rows:
+        if row.get("host") == want and "in" in row and "out" in row:
+            return row
+    return None
+
+
+def resolve_deployments(deployments, gpu_rates, rows_for, now=None):
+    """Resolve deployments.json into the emitted `deployments` layer (spec 005, US2).
+
+    `rows_for(model)` returns the per-host catalog rows for a model. The rules
+    are the overrides rules, applied verbatim: an attested price stands and is
+    cross-checked where a catalog row exists at that host (`catalog`, `drift`);
+    an unattested one yields to the catalog price when there is one and is
+    kept-and-flagged when there is not; an expired one keeps its price and asks
+    a human. A derived price names every input and is absent when one is missing
+    -- and a missing input outranks a stale claim in `review`, because it is the
+    more urgent thing. Nothing is silently dropped: an invalid entry is emitted
+    with no price so it is reported.
+    """
+    resolved = {}
+    for did, entry in deployments.items():
+        if not isinstance(entry, dict) or not validate_deployment(entry):
+            out = {k: v for k, v in entry.items() if k not in _ALL_PRICE_FIELDS} \
+                if isinstance(entry, dict) else {}
+            out.update({"source": "deployment", "baseline": False,
+                        "review": "invalid-deployment"})
+            resolved[did] = out
+            continue
+
+        unit = entry["unit"]
+        out = {k: v for k, v in entry.items() if k not in _ALL_PRICE_FIELDS}
+        out.update({"source": "deployment", "baseline": False,
+                    "host": canonical_host(entry["host"])})
+        attestation = _note_and_date_state(entry, now)
+        out["attestation"] = attestation
+        if attestation == "expired":
+            out["review"] = "attestation-expired"
+        elif attestation == "missing":
+            out["review"] = "unattested-deployment"
+
+        if "derive" in entry:
+            reason, fields = derive_deployment_price(entry, gpu_rates, now)
+            out.update(fields)
+            if reason:
+                out["review"] = reason
+            resolved[did] = out
+            continue
+
+        for f in UNITS[unit]["fields"]:
+            out[f] = entry[f]
+        catalog = None
+        if unit == DEFAULT_UNIT:
+            catalog = _catalog_row_at_host(rows_for(entry["model"]), entry["host"])
+        if attestation == "missing" and catalog is not None:
+            # Same rule as overrides: an unclaimed number yields to the catalog.
+            out["in"], out["out"] = catalog["in"], catalog["out"]
+            out["source"] = catalog["source"]
+        if catalog is not None:
+            out["catalog"] = {"host": catalog["host"], "in": catalog["in"],
+                              "out": catalog["out"], "source": catalog["source"]}
+            if out["source"] == "deployment":
+                drift = {}
+                for f in ("in", "out"):
+                    divergence = _relative_drift(out[f], catalog[f])
+                    if divergence is not None and divergence > DRIFT_TOLERANCE:
+                        drift[f] = round(divergence, 4)
+                if drift:
+                    out["drift"] = drift
+        resolved[did] = out
+    return resolved
+
+
 def run(ttl_hours=DEFAULT_TTL_HOURS, force=False,
         cache_path=CACHE_PATH, overrides_path=OVERRIDES_PATH,
         discovery_path=None,
         openrouter_url=OPENROUTER_MODELS_URL, litellm_url=LITELLM_PRICES_URL,
         openrouter_fetcher=_default_fetcher, litellm_fetcher=_default_fetcher,
-        now=None):
+        now=None, endpoints_dir=ENDPOINTS_CACHE_DIR,
+        deployments_path=None, gpu_rates_path=None):
     """Orchestrate fetch -> merge -> emit, returning an exit code.
 
     Exit codes (FR-004/FR-005, NFR-003/NFR-004) follow `_exit_for`, the single
@@ -532,6 +765,11 @@ def run(ttl_hours=DEFAULT_TTL_HOURS, force=False,
     the copy that used to live in this docstring described only the age-based
     outcome, long after this function also began signalling degradation.
     """
+    # Resolved at call time rather than bound as defaults: a default captures
+    # the module constant at import, and the hermetic suite must be able to
+    # point every call away from the shipped truth files in one place.
+    deployments_path = deployments_path or DEPLOYMENTS_PATH
+    gpu_rates_path = gpu_rates_path or GPU_RATES_PATH
     cache = _load_cache(cache_path)
 
     # Cache-hit path (FR-002): fresh cache and not forced -> zero network I/O.
@@ -564,8 +802,8 @@ def run(ttl_hours=DEFAULT_TTL_HOURS, force=False,
         print(f"warning: litellm unavailable; {reused}", file=sys.stderr)
     catalog_unavailable = openrouter_layer is None
 
-    overrides = attach_catalog_baseline(load_overrides(overrides_path),
-                                        openrouter_layer, litellm_layer, now=now)
+    raw_overrides = load_overrides(overrides_path)
+    overrides = attach_catalog_baseline(raw_overrides, openrouter_layer, litellm_layer, now=now)
     layers = [layer for layer in (openrouter_layer, litellm_layer, overrides) if layer]
     merged = merge(layers) if layers else {}
     # Every emitted price names what one unit of it buys (FR-001). Model entries
@@ -584,7 +822,18 @@ def run(ttl_hours=DEFAULT_TTL_HOURS, force=False,
             # catalog slugs get renamed, so this must not vanish silently.
             for mid in set(overrides) - set(valid):
                 flagged[mid] = "dropped-unpriceable"
-            payload = build_cache(valid, ttl_hours, _now_iso(now), "fresh", flagged)
+            # The second truth layer. Cross-checks read the per-host catalogs from
+            # this refresh's layers and the endpoint snapshots on disk -- no fetch.
+            layers_view = {"openrouter": openrouter_layer or {}, "litellm": litellm_layer or {}}
+            deployments = resolve_deployments(
+                load_deployments(deployments_path), load_gpu_rates(gpu_rates_path),
+                lambda model: host_rows(model, raw_overrides, endpoints_dir, layers_view),
+                now)
+            for did, entry in deployments.items():
+                if entry.get("review"):
+                    flagged[did] = entry["review"]
+            payload = build_cache(valid, ttl_hours, _now_iso(now), "fresh", flagged,
+                                  deployments)
             emit(payload, cache_path)
             if discovery_path:
                 _emit_discovery(discovery_path, _now_iso(now),
@@ -874,7 +1123,9 @@ class _QueryContext:
 
 
 def _refresh_cache_if_stale(cache, offline, ttl_hours, now, cache_path, overrides_path,
-                            discovery_path, openrouter_fetcher, litellm_fetcher):
+                            discovery_path, openrouter_fetcher, litellm_fetcher,
+                            endpoints_dir=ENDPOINTS_CACHE_DIR,
+                            deployments_path=None, gpu_rates_path=None):
     """Refresh a stale cache before answering, unless offline. Returns the cache."""
     if offline or (cache is not None and is_fresh(cache, ttl_hours, now=now)):
         return cache
@@ -889,7 +1140,8 @@ def _refresh_cache_if_stale(cache, offline, ttl_hours, now, cache_path, override
         run(ttl_hours=declared, force=True, cache_path=cache_path,
             overrides_path=overrides_path, discovery_path=discovery_path,
             openrouter_fetcher=openrouter_fetcher, litellm_fetcher=litellm_fetcher,
-            now=now)
+            now=now, endpoints_dir=endpoints_dir,
+            deployments_path=deployments_path, gpu_rates_path=gpu_rates_path)
     return _load_cache(cache_path)
 
 
@@ -901,8 +1153,10 @@ def _query_fresh(ctx):
                    ctx.freshness, bool(ctx.flagged))
 
 
-def _print_review_table(rows, stream=sys.stderr):
+def _print_review_table(rows, stream=None):
     """Render the review work list. stderr, so stdout stays pure JSON."""
+    stream = stream or sys.stderr  # resolved at call time, not bound at import
+
     def _pair(a, b):
         return f"{a}/{b}" if a is not None else "—"
     width = max(len(r["model"]) for r in rows)
@@ -1041,9 +1295,39 @@ def _query_cheapest(ctx, model):
                    ctx.discovery_freshness, degraded)
 
 
+def _print_deployments_table(rows, stream=None):
+    """Human view of the deployments layer. stderr, so stdout stays pure JSON."""
+    # Resolved at call time: a `stream=sys.stderr` default binds the stream that
+    # existed at import, so a redirected stderr would never see the table.
+    stream = stream or sys.stderr
+
+    def _price(r):
+        fields = UNITS.get(r.get("unit"), {}).get("fields", ())
+        vals = [r.get(f) for f in fields]
+        return "/".join(str(v) for v in vals) if vals and all(v is not None for v in vals) else "—"
+    width = max(len(r["id"]) for r in rows)
+    print(f"{'deployment'.ljust(width)}  {'unit':14}  {'price':>14}  {'attest':8}  review",
+          file=stream)
+    for r in rows:
+        print(f"{r['id'].ljust(width)}  {str(r.get('unit')):14}  {_price(r):>14}  "
+              f"{str(r.get('attestation', '')):8}  {r.get('review', '')}", file=stream)
+
+
+def _query_deployments(ctx):
+    """`query deployments` -- what we actually run, each priced in its native unit."""
+    if ctx.cache is None:
+        return ctx.out({"deployments": [], "freshness": ctx.freshness}, "no-data")
+    rows = [dict(e, id=did) for did, e in sorted((ctx.cache.get("deployments") or {}).items())]
+    if rows:
+        _print_deployments_table(rows)
+    return ctx.out({"deployments": rows, "freshness": ctx.freshness},
+                   ctx.freshness, any(r.get("review") for r in rows))
+
+
 def query_main(args, openrouter_fetcher=_default_fetcher, litellm_fetcher=_default_fetcher,
                now=None, cache_path=CACHE_PATH, overrides_path=OVERRIDES_PATH,
-               discovery_path=DISCOVERY_PATH, endpoints_dir=ENDPOINTS_CACHE_DIR):
+               discovery_path=DISCOVERY_PATH, endpoints_dir=ENDPOINTS_CACHE_DIR,
+               deployments_path=None, gpu_rates_path=None):
     """Dispatch a `query` subcommand. Prints JSON to stdout; returns an exit code.
 
     Exit codes (FR-008) follow `_exit_for`, which maps freshness *and*
@@ -1056,7 +1340,8 @@ def query_main(args, openrouter_fetcher=_default_fetcher, litellm_fetcher=_defau
 
     cache = _refresh_cache_if_stale(_load_cache(cache_path), offline, ttl_hours, now,
                                     cache_path, overrides_path, discovery_path,
-                                    openrouter_fetcher, litellm_fetcher)
+                                    openrouter_fetcher, litellm_fetcher, endpoints_dir,
+                                    deployments_path, gpu_rates_path)
     ctx = _QueryContext(cache, _freshness_status(cache, ttl_hours, now), offline,
                         ttl_hours, now, overrides_path, discovery_path, endpoints_dir,
                         openrouter_fetcher, litellm_fetcher)
@@ -1065,6 +1350,8 @@ def query_main(args, openrouter_fetcher=_default_fetcher, litellm_fetcher=_defau
         return _query_fresh(ctx)
     if action == "review":
         return _query_review(ctx)
+    if action == "deployments":
+        return _query_deployments(ctx)
 
     # Every remaining action consults discovery; the two above never do.
     ctx.load_discovery()

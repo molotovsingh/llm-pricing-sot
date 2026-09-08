@@ -44,7 +44,17 @@ from fetch_pricing import (
     _normalize_model,
     _normalize_openrouter,
     _parse_iso_utc,
+    DEPLOYMENTS_PATH,
+    GPU_RATES_PATH,
+    canonical_host,
+    load_deployments,
+    load_gpu_rates,
+    validate_deployment,
+    derive_deployment_price,
+    resolve_deployments,
+    deployment_attestation_state,
 )
+import fetch_pricing as _fp
 
 # Comfortably past the freshness gate, whatever DEFAULT_TTL_HOURS is. These
 # fixtures used a hardcoded 48h, which silently became *fresh* when the default
@@ -422,7 +432,11 @@ class TestUnits(unittest.TestCase):
                                  "openrouter_slug": "org/m"}}, fh)
             catalog = json.dumps({"data": [{"id": "org/m", "pricing":
                                             {"prompt": "0.000001", "completion": "0.000002"}}]})
+            # Hermetic: point the truth files at the temp dir, or the shipped
+            # deployments.json would be read through the default path.
             code = run(cache_path=cache, overrides_path=overrides,
+                       deployments_path=os.path.join(d, "none.json"),
+                       gpu_rates_path=os.path.join(d, "none.json"),
                        openrouter_fetcher=lambda url: catalog,
                        litellm_fetcher=lambda url: "{}")
             self.assertEqual(code, 0)
@@ -654,19 +668,34 @@ class TestRunOrchestration(unittest.TestCase):
 
 
 _network_guard = None
+_truth_file_guard = None
 
 
 def setUpModule():
     # Hermeticity (NFR-002): fail loudly if any test reaches the real HTTP fetcher.
-    global _network_guard
+    global _network_guard, _truth_file_guard
     _network_guard = mock.patch(
         "urllib.request.urlopen",
         side_effect=AssertionError("network access forbidden in tests"),
     )
     _network_guard.start()
+    # Hermeticity, second half (spec 005): the suite must never read the shipped
+    # deployments.json / gpu_rates.json by accident. Every run() / query_main() /
+    # main() call that omits a path resolves it against these module constants
+    # *at call time*, so one patch here covers them all -- including calls that
+    # only passed before because today's seeds looked valid on a real clock.
+    # TestShippedDeploymentsFile reads the real files through the names imported
+    # at the top of this module, which this patch does not touch.
+    _truth_file_guard = mock.patch.multiple(
+        _fp,
+        DEPLOYMENTS_PATH=os.path.join(os.devnull, "deployments.json"),
+        GPU_RATES_PATH=os.path.join(os.devnull, "gpu_rates.json"))
+    _truth_file_guard.start()
 
 
 def tearDownModule():
+    if _truth_file_guard is not None:
+        _truth_file_guard.stop()
     if _network_guard is not None:
         _network_guard.stop()
 
@@ -1418,3 +1447,340 @@ class TestShippedOverridesFile(unittest.TestCase):
                     {entry["openrouter_slug"]: {"in": 1.0, "out": 2.0}},
                     {}, now=aged)
                 self.assertEqual(linked[mid].get("review"), "attestation-expired")
+
+
+# ---------------- spec 005: deployments, the second truth layer ----------------
+
+class TestCanonicalHost(unittest.TestCase):
+    """R7: declared aliases collapse known forms; unknown names stay distinct."""
+
+    def test_declared_forms_collapse(self):
+        cases = [(("BaseTen", "baseten"), "baseten"),
+                 (("Fireworks", "fireworks-ai"), "fireworks"),
+                 (("Z.AI", "zai-org", "z-ai"), "zai"),
+                 (("Moonshot AI", "moonshotai"), "moonshot"),
+                 (("DeepInfra", "deepinfra"), "deepinfra"),
+                 (("Together", "together"), "together"),
+                 (("self-host", "Self Host"), "self-host")]
+        for forms, want in cases:
+            for form in forms:
+                with self.subTest(form=form):
+                    self.assertEqual(canonical_host(form), want)
+
+    def test_unknown_names_stay_distinct(self):
+        # No fuzzy merge: pricing one host as another is the _resolve_slug bug again.
+        self.assertNotEqual(canonical_host("Makora"), canonical_host("Morph"))
+        self.assertIsNone(canonical_host(None))
+        self.assertIsNone(canonical_host(""))
+
+
+class DeploymentsBase(unittest.TestCase):
+    NOW = datetime(2026, 9, 8, tzinfo=timezone.utc)
+    RATES = {"l40s@runpod": {"gpu": "L40S", "provider": "runpod", "usd_per_hour": 1.09,
+                             "note": "runpod.io/pricing", "verified_at": "2026-09-08"}}
+
+    @staticmethod
+    def attested(**fields):
+        entry = {"note": "seed", "verified_at": "2026-09-08"}
+        entry.update(fields)
+        return entry
+
+    @staticmethod
+    def rows_for(model):
+        # A per-host catalog with two hosts; cheapest first, as host_rows returns it.
+        return [{"host": "deepinfra", "in": 0.4875, "out": 1.56, "unit": DEFAULT_UNIT,
+                 "source": "openrouter-endpoints", "baseline": True},
+                {"host": "together", "in": 1.4, "out": 4.4, "unit": DEFAULT_UNIT,
+                 "source": "openrouter-endpoints", "baseline": True}]
+
+
+class TestValidateDeployment(DeploymentsBase):
+    def test_quoted_per_token_ok(self):
+        self.assertTrue(validate_deployment(self.attested(
+            model="glm-5.2", host="together", unit="per_1m_tokens", **{"in": 1.4, "out": 4.4})))
+
+    def test_derived_per_page_ok(self):
+        self.assertTrue(validate_deployment(self.attested(
+            model="deepseek-ai/DeepSeek-OCR", host="self-host", unit="per_page",
+            derive={"gpu": "l40s@runpod", "seconds_per_unit": 15})))
+
+    def test_unknown_unit_rejected(self):
+        self.assertFalse(validate_deployment(self.attested(
+            model="m", host="h", unit="per_banana", price=1)))
+
+    def test_both_price_and_derive_rejected(self):
+        self.assertFalse(validate_deployment(self.attested(
+            model="m", host="h", unit="per_page", price=1, derive={"gpu": "l40s@runpod"})))
+
+    def test_neither_price_nor_derive_rejected(self):
+        self.assertFalse(validate_deployment(self.attested(model="m", host="h", unit="per_page")))
+
+    def test_derived_two_field_unit_rejected(self):
+        # A seconds measurement yields one number; per_1m_tokens needs two.
+        self.assertFalse(validate_deployment(self.attested(
+            model="m", host="self-host", unit="per_1m_tokens", derive={"gpu": "l40s@runpod"})))
+
+    def test_derived_per_month_rejected(self):
+        self.assertFalse(validate_deployment(self.attested(
+            model="m", host="self-host", unit="per_month", derive={"gpu": "l40s@runpod"})))
+
+    def test_missing_host_or_model_rejected(self):
+        self.assertFalse(validate_deployment(self.attested(model="m", unit="per_page", price=1)))
+        self.assertFalse(validate_deployment(self.attested(host="h", unit="per_page", price=1)))
+
+
+class TestDeriveDeploymentPrice(DeploymentsBase):
+    def _derived(self, **derive):
+        return self.attested(model="m", host="self-host", unit="per_page",
+                             derive=dict({"gpu": "l40s@runpod", "seconds_per_unit": 15}, **derive))
+
+    def test_math_and_the_rate_is_named(self):
+        reason, fields = derive_deployment_price(self._derived(), self.RATES, now=self.NOW)
+        self.assertIsNone(reason)
+        self.assertAlmostEqual(fields["price"], 1.09 * 15 / 3600, places=8)
+        self.assertEqual(fields["rate"], {"key": "l40s@runpod", "usd_per_hour": 1.09,
+                                          "provider": "runpod"})
+
+    def test_missing_rate_yields_no_price(self):
+        reason, fields = derive_deployment_price(self._derived(gpu="h100@nowhere"),
+                                                 self.RATES, now=self.NOW)
+        self.assertEqual((reason, fields), ("gpu-rate-missing", {}))
+
+    def test_bench_missing_yields_no_price(self):
+        for bad in (0, -1, None, "15", True):
+            with self.subTest(seconds_per_unit=bad):
+                reason, fields = derive_deployment_price(
+                    self._derived(seconds_per_unit=bad), self.RATES, now=self.NOW)
+                self.assertEqual((reason, fields), ("bench-missing", {}))
+
+    def test_expired_rate_keeps_price_and_flags(self):
+        rates = {"l40s@runpod": dict(self.RATES["l40s@runpod"], verified_at="2026-01-01")}
+        reason, fields = derive_deployment_price(self._derived(), rates, now=self.NOW)
+        self.assertEqual(reason, "gpu-rate-expired")
+        self.assertIn("price", fields)
+
+    def test_unattested_rate_keeps_price_and_flags(self):
+        rates = {"l40s@runpod": {"usd_per_hour": 1.09}}
+        reason, fields = derive_deployment_price(self._derived(), rates, now=self.NOW)
+        self.assertEqual(reason, "gpu-rate-unattested")
+        self.assertIn("price", fields)
+
+
+class TestResolveDeployments(DeploymentsBase):
+    def _resolve(self, **deployments):
+        return resolve_deployments(deployments, self.RATES, self.rows_for, now=self.NOW)
+
+    def test_attested_quoted_is_cross_checked_without_drift(self):
+        out = self._resolve(**{"glm-5.2@together": self.attested(
+            model="glm-5.2", host="together", unit="per_1m_tokens", **{"in": 1.4, "out": 4.4})})
+        e = out["glm-5.2@together"]
+        self.assertEqual((e["in"], e["out"], e["source"], e["baseline"]), (1.4, 4.4, "deployment", False))
+        self.assertEqual(e["catalog"]["host"], "together")
+        self.assertNotIn("drift", e)
+        self.assertNotIn("review", e)
+        self.assertEqual(e["attestation"], "valid")
+
+    def test_attested_quoted_records_drift(self):
+        out = self._resolve(**{"glm-5.2@together": self.attested(
+            model="glm-5.2", host="together", unit="per_1m_tokens", **{"in": 2.0, "out": 4.4})})
+        self.assertIn("in", out["glm-5.2@together"]["drift"])
+        self.assertNotIn("out", out["glm-5.2@together"]["drift"])
+
+    def test_cross_check_uses_the_named_host_not_the_cheapest(self):
+        # SC-001 in miniature: Together, not DeepInfra.
+        out = self._resolve(**{"glm-5.2@together": self.attested(
+            model="glm-5.2", host="Together", unit="per_1m_tokens", **{"in": 1.4, "out": 4.4})})
+        self.assertEqual(out["glm-5.2@together"]["catalog"]["in"], 1.4)
+
+    def test_unattested_with_catalog_yields_to_catalog(self):
+        out = self._resolve(**{"glm-5.2@together": {
+            "model": "glm-5.2", "host": "together", "unit": "per_1m_tokens", "in": 9.0, "out": 9.0}})
+        e = out["glm-5.2@together"]
+        self.assertEqual((e["in"], e["out"]), (1.4, 4.4))
+        self.assertEqual(e["source"], "openrouter-endpoints")
+        self.assertEqual(e["review"], "unattested-deployment")
+
+    def test_unattested_without_catalog_is_kept_and_flagged(self):
+        out = self._resolve(**{"glm-5.2@novita": {
+            "model": "glm-5.2", "host": "novita", "unit": "per_1m_tokens", "in": 9.0, "out": 9.0}})
+        e = out["glm-5.2@novita"]
+        self.assertEqual((e["in"], e["out"], e["source"]), (9.0, 9.0, "deployment"))
+        self.assertEqual(e["review"], "unattested-deployment")
+        self.assertNotIn("catalog", e)
+
+    def test_expired_keeps_price(self):
+        out = self._resolve(**{"glm-5.2@together": self.attested(
+            model="glm-5.2", host="together", unit="per_1m_tokens",
+            verified_at="2026-01-01", **{"in": 1.4, "out": 4.4})})
+        e = out["glm-5.2@together"]
+        self.assertEqual((e["in"], e["review"], e["attestation"]), (1.4, "attestation-expired", "expired"))
+
+    def test_derived_emits_price_and_rate(self):
+        out = self._resolve(**{"ocr@self-host": self.attested(
+            model="deepseek-ai/DeepSeek-OCR", host="self-host", unit="per_page",
+            derive={"gpu": "l40s@runpod", "seconds_per_unit": 15, "bench_run": "r1"})})
+        e = out["ocr@self-host"]
+        self.assertAlmostEqual(e["price"], 1.09 * 15 / 3600, places=8)
+        self.assertEqual(e["rate"]["key"], "l40s@runpod")
+        self.assertNotIn("review", e)
+
+    def test_derived_missing_input_is_reported_not_dropped(self):
+        out = self._resolve(**{"ocr@self-host": self.attested(
+            model="m", host="self-host", unit="per_page", derive={"gpu": "h100@nowhere"})})
+        e = out["ocr@self-host"]
+        self.assertEqual(e["review"], "gpu-rate-missing")
+        self.assertNotIn("price", e)
+
+    def test_missing_input_outranks_stale_claim(self):
+        out = self._resolve(**{"ocr@self-host": self.attested(
+            model="m", host="self-host", unit="per_page", verified_at="2026-01-01",
+            derive={"gpu": "h100@nowhere"})})
+        self.assertEqual(out["ocr@self-host"]["review"], "gpu-rate-missing")
+
+    def test_invalid_entry_is_reported_never_dropped(self):
+        out = self._resolve(**{"junk@h": {"model": "m", "host": "h", "unit": "per_banana", "price": 1}})
+        self.assertEqual(out["junk@h"]["review"], "invalid-deployment")
+        self.assertNotIn("price", out["junk@h"])
+
+    def test_non_token_unit_is_never_cross_checked(self):
+        out = self._resolve(**{"ocr@replicate": self.attested(
+            model="glm-5.2", host="together", unit="per_run", price=0.014)})
+        e = out["ocr@replicate"]
+        self.assertEqual(e["price"], 0.014)
+        self.assertNotIn("catalog", e)
+
+
+class TestDeploymentsInRun(unittest.TestCase):
+    """The layer rides in the envelope and degrades the exit code like an override."""
+
+    def _run(self, deployments):
+        with tempfile.TemporaryDirectory() as d:
+            paths = {k: os.path.join(d, f"{k}.json")
+                     for k in ("overrides", "cache", "deployments", "gpu_rates")}
+            with open(paths["overrides"], "w", encoding="utf-8") as fh:
+                json.dump({"m": {"tokenizer": "tiktoken:o200k_base", "openrouter_slug": "org/m"}}, fh)
+            with open(paths["deployments"], "w", encoding="utf-8") as fh:
+                json.dump(deployments, fh)
+            with open(paths["gpu_rates"], "w", encoding="utf-8") as fh:
+                json.dump(DeploymentsBase.RATES, fh)
+            catalog = json.dumps({"data": [{"id": "org/m", "pricing":
+                                            {"prompt": "0.000001", "completion": "0.000002"}}]})
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                code = run(cache_path=paths["cache"], overrides_path=paths["overrides"],
+                           deployments_path=paths["deployments"], gpu_rates_path=paths["gpu_rates"],
+                           endpoints_dir=os.path.join(d, "endpoints"),
+                           openrouter_fetcher=lambda url: catalog, litellm_fetcher=lambda url: "{}",
+                           now=DeploymentsBase.NOW)
+            with open(paths["cache"], encoding="utf-8") as fh:
+                return code, json.load(fh), buf.getvalue()
+
+    def test_clean_deployments_exit_0(self):
+        code, env, err = self._run({"m@together": DeploymentsBase.attested(
+            model="m", host="together", unit="per_1m_tokens", **{"in": 1.0, "out": 2.0})})
+        self.assertEqual(code, 0)
+        self.assertEqual(env["deployments"]["m@together"]["in"], 1.0)
+        self.assertEqual(env["needs_review"], [])
+
+    def test_flagged_deployment_degrades_exit_and_rolls_up(self):
+        code, env, err = self._run({"ocr@self-host": DeploymentsBase.attested(
+            model="x", host="self-host", unit="per_page", derive={"gpu": "h100@nowhere"})})
+        self.assertEqual(code, 1)
+        self.assertEqual(env["needs_review"], ["ocr@self-host"])
+        self.assertIn("ocr@self-host: gpu-rate-missing", err)
+
+    def test_missing_deployments_file_is_an_empty_layer(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(load_deployments(os.path.join(d, "nope.json")), {})
+            self.assertEqual(load_gpu_rates(os.path.join(d, "nope.json")), {})
+
+
+class TestQueryDeployments(unittest.TestCase):
+    def _query(self, deployments):
+        with tempfile.TemporaryDirectory() as d:
+            cache_path = os.path.join(d, "pricing.json")
+            emit(build_cache({}, 24, _now_iso(), "fresh", [k for k, v in deployments.items()
+                                                            if v.get("review")], deployments),
+                 cache_path)
+            args = argparse.Namespace(action="deployments", model=None, offline=True, ttl_hours=24)
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = query_main(args, cache_path=cache_path,
+                                  openrouter_fetcher=lambda u: (_ for _ in ()).throw(AssertionError("network")),
+                                  litellm_fetcher=lambda u: (_ for _ in ()).throw(AssertionError("network")))
+            return code, json.loads(out.getvalue()), err.getvalue()
+
+    def test_lists_deployments_with_units_exit_0(self):
+        code, data, err = self._query({"m@together": {"model": "m", "host": "together",
+                                                      "unit": "per_1m_tokens", "in": 1.0, "out": 2.0,
+                                                      "attestation": "valid"}})
+        self.assertEqual(code, 0)
+        self.assertEqual(data["deployments"][0]["id"], "m@together")
+        self.assertEqual(data["deployments"][0]["unit"], "per_1m_tokens")
+        self.assertIn("deployment", err.splitlines()[0])  # the stderr table header
+
+    def test_flagged_deployment_exits_1(self):
+        code, data, _ = self._query({"x@self-host": {"model": "x", "host": "self-host",
+                                                     "unit": "per_page", "review": "gpu-rate-missing"}})
+        self.assertEqual(code, 1)
+        self.assertTrue(data["degraded"])
+
+    def test_no_cache_exits_2(self):
+        with tempfile.TemporaryDirectory() as d:
+            args = argparse.Namespace(action="deployments", model=None, offline=True, ttl_hours=24)
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                code = query_main(args, cache_path=os.path.join(d, "none.json"))
+        self.assertEqual(code, 2)
+
+
+class TestShippedDeploymentsFile(unittest.TestCase):
+    """The real deployments.json and gpu_rates.json are contracts; shape-check them.
+
+    Hermetic and clock-pinned: attestation *shape* is asserted, never freshness --
+    expiry reaches a human through needs_review, not through a red suite.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.deployments = load_deployments(DEPLOYMENTS_PATH)
+        cls.rates = load_gpu_rates(GPU_RATES_PATH)
+
+    def test_files_parse_and_are_not_empty(self):
+        self.assertGreater(len(self.deployments), 0)
+        self.assertGreater(len(self.rates), 0)
+
+    def test_every_deployment_validates_and_is_keyed_model_at_host(self):
+        for did, entry in self.deployments.items():
+            with self.subTest(deployment=did):
+                self.assertTrue(validate_deployment(entry), did)
+                self.assertRegex(did, r"^[^@]+@[^@]+$")
+                self.assertEqual(canonical_host(did.rsplit("@", 1)[1]), canonical_host(entry["host"]))
+
+    def test_every_deployment_is_fully_attested(self):
+        for did, entry in self.deployments.items():
+            with self.subTest(deployment=did):
+                self.assertTrue(str(entry.get("note", "")).strip(), "empty note")
+                self.assertIsNotNone(_parse_iso_utc(entry.get("verified_at")))
+
+    def test_every_derived_entry_names_a_shipped_rate(self):
+        for did, entry in self.deployments.items():
+            if "derive" in entry:
+                with self.subTest(deployment=did):
+                    self.assertIn(entry["derive"]["gpu"], self.rates)
+                    self.assertGreater(entry["derive"]["seconds_per_unit"], 0)
+
+    def test_every_rate_is_shaped_and_attested(self):
+        for key, rate in self.rates.items():
+            with self.subTest(rate=key):
+                self.assertRegex(key, r"^[a-z0-9\-]+@[a-z0-9\-]+$")
+                self.assertTrue(rate.get("usd_per_hour", -1) > 0)
+                self.assertTrue(str(rate.get("note", "")).strip())
+                self.assertIsNotNone(_parse_iso_utc(rate.get("verified_at")))
+                self.assertEqual(rate.get("provider"), key.rsplit("@", 1)[1])
+
+    def test_attestations_are_valid_on_their_own_date(self):
+        # Pinned to each entry's verified_at, so this never depends on today.
+        for did, entry in list(self.deployments.items()) + list(self.rates.items()):
+            with self.subTest(entry=did):
+                on_date = _parse_iso_utc(entry["verified_at"]) + timedelta(days=1)
+                self.assertEqual(deployment_attestation_state(entry, now=on_date), "valid")

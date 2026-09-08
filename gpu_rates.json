@@ -1,0 +1,27 @@
+{
+  "_comment": "Attested GPU rates, USD per hour, keyed <gpu>@<provider>. Never averaged across providers: you pay one of them. A derived deployment names one of these keys. Each entry is a price and is treated like one: it needs `note` + `verified_at`, expires after ATTESTATION_MAX_AGE_DAYS, and an expired or missing rate is reported on every deployment that uses it -- never guessed. Seeded 2026-09-08 from public on-demand pricing pages; replace with the provider and tier you actually use.",
+
+  "l40s@runpod":      {"gpu": "L40S",       "provider": "runpod", "tier": "secure-cloud", "usd_per_hour": 1.09,
+                       "note": "runpod.io/pricing, Secure Cloud on-demand", "verified_at": "2026-09-08"},
+  "a100-80gb@runpod": {"gpu": "A100 80GB",  "provider": "runpod", "tier": "secure-cloud", "usd_per_hour": 1.59,
+                       "note": "runpod.io/pricing, Secure Cloud on-demand (PCIe and SXM priced alike)", "verified_at": "2026-09-08"},
+  "h100-pcie@runpod": {"gpu": "H100 PCIe",  "provider": "runpod", "tier": "secure-cloud", "usd_per_hour": 2.89,
+                       "note": "runpod.io/pricing, Secure Cloud on-demand", "verified_at": "2026-09-08"},
+  "h100-sxm@runpod":  {"gpu": "H100 SXM",   "provider": "runpod", "tier": "secure-cloud", "usd_per_hour": 3.49,
+                       "note": "runpod.io/pricing, Secure Cloud on-demand", "verified_at": "2026-09-08"},
+  "l4@runpod":        {"gpu": "L4",         "provider": "runpod", "tier": "secure-cloud", "usd_per_hour": 0.49,
+                       "note": "runpod.io/pricing, Secure Cloud on-demand", "verified_at": "2026-09-08"},
+
+  "l40s@modal":       {"gpu": "L40S",       "provider": "modal",  "tier": "per-second",   "usd_per_hour": 1.95,
+                       "note": "modal.com/pricing, $0.000542/s billed per second", "verified_at": "2026-09-08"},
+  "a100-80gb@modal":  {"gpu": "A100 80GB",  "provider": "modal",  "tier": "per-second",   "usd_per_hour": 2.50,
+                       "note": "modal.com/pricing, $0.000694/s billed per second", "verified_at": "2026-09-08"},
+  "h100-sxm@modal":   {"gpu": "H100 SXM5",  "provider": "modal",  "tier": "per-second",   "usd_per_hour": 3.95,
+                       "note": "modal.com/pricing, $0.001097/s billed per second", "verified_at": "2026-09-08"},
+  "l4@modal":         {"gpu": "L4",         "provider": "modal",  "tier": "per-second",   "usd_per_hour": 0.80,
+                       "note": "modal.com/pricing, $0.000222/s billed per second", "verified_at": "2026-09-08"},
+  "a10@modal":        {"gpu": "A10",        "provider": "modal",  "tier": "per-second",   "usd_per_hour": 1.10,
+                       "note": "modal.com/pricing, $0.000306/s billed per second", "verified_at": "2026-09-08"},
+  "t4@modal":         {"gpu": "T4",         "provider": "modal",  "tier": "per-second",   "usd_per_hour": 0.59,
+                       "note": "modal.com/pricing, $0.000164/s billed per second", "verified_at": "2026-09-08"}
+}

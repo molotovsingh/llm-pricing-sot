@@ -153,6 +153,8 @@ and regenerates every governed block.
 | `gpu-rate-missing` | derived deployment | `derive.gpu` not in `gpu_rates.json`; no price emitted |
 | `gpu-rate-expired` | derived deployment | the rate it uses has an expired attestation; price kept |
 | `bench-missing` | derived deployment | `derive.seconds_per_unit` absent or ≤ 0; no price emitted |
+| `gpu-rate-unattested` | derived deployment | the rate it uses has no `note` / parseable `verified_at`; price kept, a human must claim the rate |
+| `invalid-deployment` | deployment | shape failed validation (missing `model`/`host`/`unit`, unknown unit, both or neither of price fields and `derive`); emitted with no price so it is reported, never silently dropped |
 
 Existing reasons (`unattested-price-ignored`, `attestation-expired`,
 `unverifiable-price`, `dropped-unpriceable`) are unchanged for `models`.

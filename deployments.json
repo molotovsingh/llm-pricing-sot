@@ -1,0 +1,22 @@
+{
+  "_comment": "Layer 1b (truth): what we actually run. Keyed <model>@<host>. Each entry names its `unit` and EITHER declares the price in that unit's fields (quoted) OR a `derive` block for self-hosted work (gpu = a key in gpu_rates.json, seconds_per_unit = measured, bench_run = the run that measured it); the pipeline computes usd_per_hour * seconds_per_unit / 3600 and names the rate it used. Every entry is attested with `note` + `verified_at` and expires like an override. A quoted per-token deployment at a catalog host is cross-checked against the per-host catalog price and any gap recorded as `drift`. Seeded 2026-09-08 from public pricing pages verified that day; replace with the hosts you actually use.",
+
+  "kimi-k3@together":  {"model": "kimi-k3", "host": "together", "unit": "per_1m_tokens",
+                        "in": 3.0, "out": 15.0,
+                        "note": "together.ai/pricing serverless list price", "verified_at": "2026-09-08"},
+  "glm-5.2@together":  {"model": "glm-5.2", "host": "together", "unit": "per_1m_tokens",
+                        "in": 1.40, "out": 4.40,
+                        "note": "together.ai/pricing serverless list price", "verified_at": "2026-09-08"},
+  "glm-5.2@baseten":   {"model": "glm-5.2", "host": "baseten", "unit": "per_1m_tokens",
+                        "in": 1.40, "out": 4.40,
+                        "note": "baseten.co/pricing Model APIs list price", "verified_at": "2026-09-08"},
+  "deepseek-v4-pro-0813@together": {"model": "deepseek-v4-pro-0813", "host": "together", "unit": "per_1m_tokens",
+                        "in": 1.32, "out": 3.96,
+                        "note": "together.ai/pricing lists the 0813 variant; distinct from the base V4 Pro SKU", "verified_at": "2026-09-08"},
+
+  "deepseek-ocr@self-host": {"model": "deepseek-ai/DeepSeek-OCR", "host": "self-host", "unit": "per_page",
+                        "derive": {"gpu": "l40s@runpod", "seconds_per_unit": 15,
+                                   "bench_run": "replicate-published-typical-run-2026-09-08"},
+                        "note": "PLACEHOLDER measurement: 15 s is Replicate's published typical run time for lucataco/deepseek-ocr on an L40S, treated as one page per run. Replace seconds_per_unit and bench_run with a Matterwork bench measurement.",
+                        "verified_at": "2026-09-08"}
+}
