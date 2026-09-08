@@ -61,6 +61,22 @@ def render_envelope():
     return f"Cache envelope keys: {keys}."
 
 
+def derive_units():
+    """The unit vocabulary, straight from the code that validates against it."""
+    return [(unit, spec["fields"], spec["buys"]) for unit, spec in fetch_pricing.UNITS.items()]
+
+
+def render_units():
+    lines = ["| unit | price fields | one unit buys |", "|---|---|---|"]
+    for unit, fields, buys in derive_units():
+        lines.append(f"| `{unit}` | {', '.join(f'`{f}`' for f in fields)} | {buys} |")
+    lines.append("")
+    lines.append("Per-token prices are USD per 1M tokens. A unit's fields are never reused "
+                 "for another unit, so a consumer that multiplies `in`/`out` by a token "
+                 "count cannot pick up a per-page price by mistake.")
+    return "\n".join(lines)
+
+
 def render_trust_rule():
     return "\n".join([
         "- `baseline: false` → the model is tracked by the SOT; use this price.",
@@ -75,6 +91,7 @@ FACTS = {
     "exit-codes": render_exit_codes,
     "envelope": render_envelope,
     "trust-rule": render_trust_rule,
+    "units": render_units,
 }
 
 
@@ -83,12 +100,13 @@ FACTS = {
 # --------------------------------------------------------------------------
 
 GOVERNED = {
-    "skills/llm-pricing/SKILL.md": ("exit-codes", "trust-rule"),
-    "README.md": ("exit-codes", "envelope", "trust-rule"),
-    ".specify/memory/constitution.md": ("exit-codes", "envelope"),
+    "skills/llm-pricing/SKILL.md": ("exit-codes", "trust-rule", "units"),
+    "README.md": ("exit-codes", "envelope", "trust-rule", "units"),
+    ".specify/memory/constitution.md": ("exit-codes", "envelope", "units"),
     "specs/001-pricing-query/contracts/query-cli.md": ("exit-codes",),
     "specs/001-pricing-query/quickstart.md": ("exit-codes", "trust-rule"),
     "specs/002-pricing-endpoints/contracts/cheapest-query.md": ("exit-codes",),
+    "specs/005-cost-per-unit/contracts/deployments-and-hosts.md": ("units",),
 }
 
 # Exempt by declared path rule, never by inference from content (FR-006).
@@ -439,7 +457,14 @@ class TestFactsDerivedFromCode(unittest.TestCase):
 
     def test_envelope_matches_build_cache(self):
         self.assertEqual(derive_envelope(),
-                         ["fetched_at", "freshness", "models", "needs_review", "ttl_hours"])
+                         ["deployments", "fetched_at", "freshness", "models",
+                          "needs_review", "ttl_hours"])
+
+    def test_units_fact_is_derived_from_code(self):
+        rendered = render_units()
+        for unit in fetch_pricing.UNITS:
+            self.assertIn(f"`{unit}`", rendered)
+        self.assertEqual(render_units(), render_units())
 
     def test_renderings_are_deterministic(self):
         for fact_id, render in FACTS.items():

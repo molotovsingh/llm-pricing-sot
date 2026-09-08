@@ -15,6 +15,8 @@ import urllib.request
 
 from fetch_pricing import (
     DEFAULT_TTL_HOURS,
+    DEFAULT_UNIT,
+    UNITS,
     ATTESTATION_MAX_AGE_DAYS,
     DRIFT_TOLERANCE,
     attestation_state,
@@ -368,6 +370,67 @@ class TestValidateEntry(unittest.TestCase):
         }
         result = filter_valid(models)
         self.assertEqual(list(result.keys()), ["ok"])
+
+
+class TestUnits(unittest.TestCase):
+    """FR-001: every price carries a unit from a closed, governed vocabulary."""
+
+    PER_TOKEN = {"tokenizer": "tiktoken:o200k_base", "in": 1.0, "out": 2.0}
+
+    def test_vocabulary_is_closed_and_self_describing(self):
+        self.assertEqual(DEFAULT_UNIT, "per_1m_tokens")
+        self.assertIn(DEFAULT_UNIT, UNITS)
+        for unit, spec in UNITS.items():
+            with self.subTest(unit=unit):
+                self.assertTrue(spec["fields"], "a unit must name its price fields")
+                self.assertTrue(spec["buys"], "a unit must say what it buys")
+
+    def test_token_fields_belong_to_the_token_unit_only(self):
+        # The invariant that keeps a per-page price out of a token multiplier.
+        for unit, spec in UNITS.items():
+            with self.subTest(unit=unit):
+                if unit == DEFAULT_UNIT:
+                    self.assertEqual(set(spec["fields"]), {"in", "out"})
+                else:
+                    self.assertFalse({"in", "out"} & set(spec["fields"]))
+
+    def test_legacy_entry_without_unit_is_per_token(self):
+        self.assertTrue(validate_entry(dict(self.PER_TOKEN)))
+
+    def test_explicit_per_token_unit_is_valid(self):
+        self.assertTrue(validate_entry(dict(self.PER_TOKEN, unit=DEFAULT_UNIT)))
+
+    def test_unknown_unit_is_rejected(self):
+        self.assertFalse(validate_entry(dict(self.PER_TOKEN, unit="per_banana")))
+
+    def test_non_token_unit_is_rejected_from_models(self):
+        # Deployments carry those; a model entry is per-token by definition.
+        self.assertFalse(validate_entry({"tokenizer": "tiktoken:o200k_base",
+                                         "unit": "per_page", "price": 0.01}))
+
+    def test_foreign_price_field_is_rejected(self):
+        # A `price` on a per-token entry is a per-page number in the wrong place.
+        self.assertFalse(validate_entry(dict(self.PER_TOKEN, price=0.01)))
+        self.assertFalse(validate_entry(dict(self.PER_TOKEN, usd_per_hour=1.0)))
+
+    def test_run_stamps_unit_on_every_model_and_emits_deployments(self):
+        with tempfile.TemporaryDirectory() as d:
+            overrides = os.path.join(d, "overrides.json")
+            cache = os.path.join(d, "pricing.json")
+            with open(overrides, "w", encoding="utf-8") as fh:
+                json.dump({"m": {"tokenizer": "tiktoken:o200k_base",
+                                 "openrouter_slug": "org/m"}}, fh)
+            catalog = json.dumps({"data": [{"id": "org/m", "pricing":
+                                            {"prompt": "0.000001", "completion": "0.000002"}}]})
+            code = run(cache_path=cache, overrides_path=overrides,
+                       openrouter_fetcher=lambda url: catalog,
+                       litellm_fetcher=lambda url: "{}")
+            self.assertEqual(code, 0)
+            with open(cache, encoding="utf-8") as fh:
+                env = json.load(fh)
+        self.assertEqual(env["deployments"], {})
+        self.assertEqual(env["models"]["m"]["unit"], DEFAULT_UNIT)
+        self.assertEqual((env["models"]["m"]["in"], env["models"]["m"]["out"]), (1.0, 2.0))
 
 
 class TestIsFresh(unittest.TestCase):

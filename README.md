@@ -51,13 +51,27 @@ Optional later upgrade: a keep-warm cron that calls the *same script* daily (pre
 
 Every consumer reads the **same file**: `<repo>/cache/pricing.json` (repo-local).
 
-**Schema you read:** `{ "fetched_at": "<ISO-8601 UTC>", "ttl_hours": 168, "freshness": "fresh", "needs_review": ["<model_id>", ...], "models": { "<model_id>": { "in": <$/1M>, "out": <$/1M>, "tokenizer": "...", "fallback" (optional), "source": "override"|"openrouter"|"litellm", "catalog" (optional), "drift" (optional), "review" (optional) } } }`. Prices are USD per 1M tokens.
+**Schema you read:** `{ "fetched_at": "<ISO-8601 UTC>", "ttl_hours": 168, "freshness": "fresh", "needs_review": ["<model_id>", ...], "models": { "<model_id>": { "in": <$/1M>, "out": <$/1M>, "tokenizer": "...", "fallback" (optional), "source": "override"|"openrouter"|"litellm", "catalog" (optional), "drift" (optional), "review" (optional) } } }`. Every entry names its `unit`; per-token prices are USD per 1M tokens.
 
 The envelope keys are fixed:
 
 <!-- contract:begin envelope -->
-Cache envelope keys: `fetched_at`, `freshness`, `models`, `needs_review`, `ttl_hours`.
+Cache envelope keys: `deployments`, `fetched_at`, `freshness`, `models`, `needs_review`, `ttl_hours`.
 <!-- contract:end envelope -->
+
+**Every price carries a `unit`.** The vocabulary is derived from code, not restated:
+
+<!-- contract:begin units -->
+| unit | price fields | one unit buys |
+|---|---|---|
+| `per_1m_tokens` | `in`, `out` | one million input / output tokens |
+| `per_page` | `price` | one page processed |
+| `per_run` | `price` | one request / invocation |
+| `per_gpu_hour` | `usd_per_hour` | one hour of the named GPU |
+| `per_month` | `price` | one month, flat -- cost per unit of work needs a volume |
+
+Per-token prices are USD per 1M tokens. A unit's fields are never reused for another unit, so a consumer that multiplies `in`/`out` by a token count cannot pick up a per-page price by mistake.
+<!-- contract:end units -->
 
 **`freshness` is about age, not correctness.** It reports when the data was last fetched, not whether a price is right. That is what `needs_review` is for. Check both.
 

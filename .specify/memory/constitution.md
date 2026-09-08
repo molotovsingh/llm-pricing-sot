@@ -1,29 +1,36 @@
 <!--
 Sync Impact Report
 ===================
-Version change: 1.0.0 → 2.0.0 (MAJOR — two principles redefined)
+Version change: 2.0.0 → 3.0.0 (MAJOR — two principles redefined, one data constraint replaced)
 Modified principles:
-  - II Single Source of Truth — merge precedence corrected to
-    overrides > OpenRouter catalog > LiteLLM. v1.0.0 ranked LiteLLM above
-    OpenRouter, which spec 002 ("demote LiteLLM to fallback cross-check")
-    superseded without the constitution being amended; the README build-status
-    line and the code disagreed with it too. Also adds the attestation rule:
-    a hand-typed price is trusted only when attested.
-  - III File + CLI Contract — exit 1 redefined from "stale" to the broader
-    "served but degraded" (stale cache OR entries needing review), so a
-    consumer cannot use an unverified price while seeing a success code.
-  - IV On-Demand with TTL-Gated Cache — clarifies that only the load-bearing
-    source failing forces the stale path.
+  - II Single Source of Truth — the truth layer becomes two files. `overrides.json`
+    keeps the tokenizer mapping and attested per-token rates; `deployments.json`
+    records what we actually run — a model at a host or on our own hardware — priced
+    in its native unit and attested, with self-hosted prices derived from an attested
+    `gpu_rates.json` and a benchmark measurement. The catalog is demoted from source
+    of truth to verifier: it cross-checks deployments where a per-token equivalent
+    exists. Merge precedence for `models` is unchanged.
+  - IV On-Demand with TTL-Gated Cache — the Hugging Face router joins LiteLLM as a
+    demoted source: its failure reuses the last known layer and never discards an
+    otherwise healthy refresh.
+Modified sections:
+  - Data & Schema Constraints — "Prices MUST be USD per 1M tokens" is replaced by a
+    governed unit vocabulary: every price carries a `unit`; per-token prices remain
+    USD per 1M tokens. The envelope gains exactly one key, `deployments`.
 Added sections: none
 Removed sections: none
 Templates requiring updates:
-  - .specify/templates/plan-template.md — Constitution Check gates still valid ✅
+  - .specify/templates/plan-template.md — gates reference principles by name; still valid ✅
   - .specify/templates/spec-template.md — no constitution references ✅
   - .specify/templates/tasks-template.md — no constitution references ✅
 Follow-up TODOs:
-  - Ratification of this amendment is the maintainer's call; it was drafted to
-    stop the constitution from contradicting shipped behaviour, not to decide
-    policy.
+  - Seeded `deployments.json` and `gpu_rates.json` entries carry public-page provenance
+    dated 2026-09-08; the maintainer should replace them with the hosts and rates
+    actually used, and the derived OCR entry's `seconds_per_unit` with a bench run.
+Rationale: specs/005-cost-per-unit/research.md §R1–R8. The per-token catalog was
+verified exact for proprietary and hosted open-weight models and structurally unable
+to price specialist and self-hosted models, which are sold per page, per run, per
+GPU-hour, flat, or not at all.
 -->
 
 # LLM Pricing SOT Constitution
@@ -39,20 +46,32 @@ anywhere an agent runs, with zero install step.
 
 ### II. Single Source of Truth
 
-`overrides.json` is the truth layer: it carries the tokenizer/fallback mapping
-(no external source publishes one) and, where applicable, what we actually pay.
-Merge precedence MUST be overrides > OpenRouter catalog > LiteLLM; LiteLLM is a
-demoted fallback/cross-check, since it is community-maintained and carries stale
-rows. A model with no resolvable tokenizer MUST NOT be emitted with a guessed
-tokenizer. Discovery-sourced pricing MUST be labeled with its source and marked
+The truth layer is two hand-held, attested, expiring files:
+
+- `overrides.json` carries the tokenizer/fallback mapping (no external source
+  publishes one), catalog pins (`openrouter_slug`, `hf_id`), and — only where we pay
+  a rate the catalog does not list — an attested per-token price.
+- `deployments.json` carries **what we actually run**: a model at a named host, or on
+  our own hardware, priced in its native unit. A self-hosted deployment declares no
+  price; it names a GPU rate from `gpu_rates.json` and a measured `seconds_per_unit`
+  with the benchmark run that produced it, and the pipeline derives the price.
+
+The catalog is a **verifier, not the truth**. For `models`, merge precedence MUST be
+overrides > OpenRouter catalog > LiteLLM; LiteLLM and the Hugging Face router are
+demoted sources, community- or aggregator-maintained and known to lag. A model with no
+resolvable tokenizer MUST NOT be emitted in `models` with a guessed tokenizer;
+non-token deployments have no tokenizer by nature and are emitted only under
+`deployments`. Catalog-sourced pricing MUST be labeled with its source and marked
 `baseline: true` so consumers never confuse it with truth.
 
-A hand-typed price is NOT automatically truth. It MUST be trusted only when the
-entry attests to it (`negotiated` + `note` + `verified_at`); otherwise the
-pipeline MUST discard it in favour of the catalog price and report the entry.
-Attestations MUST expire, or the attestation flag becomes a permanent mute
-button and hand-maintained prices rot exactly as before. An override that can be
-priced by neither route MUST be reported, never silently dropped.
+A hand-typed price is NOT automatically truth. It MUST be trusted only when the entry
+attests to it (`note` + `verified_at`; `negotiated` where the rate is not public);
+otherwise the pipeline MUST discard it in favour of a catalog price where one exists
+at that host, keep it and report it otherwise. Attestations — on overrides,
+deployments and GPU rates alike — MUST expire, or the attestation flag becomes a
+permanent mute button and hand-maintained prices rot exactly as before. A derived
+price MUST name every input it used and MUST NOT be emitted when an input is missing.
+An entry that can be priced by no route MUST be reported, never silently dropped.
 
 ### III. File + CLI Contract (No Server)
 
@@ -86,29 +105,46 @@ I/O. A stale or missing cache triggers fetch → merge → emit. When the
 load-bearing source (the OpenRouter catalog, which slug resolution and price
 inheritance both read) is unreachable, the tool MUST serve stale cache with a
 staleness flag (never block), or exit `2` when nothing usable exists. A demoted
-source failing MUST NOT discard an otherwise healthy refresh.
+source failing — LiteLLM or the Hugging Face router — MUST NOT discard an
+otherwise healthy refresh; its last known layer is reused and the reuse is reported.
 
 ### V. Hermetic, Deterministic Testing
 
 The default test suite MUST never touch the network (source fetchers are
 injectable; tests substitute fakes). Emitted entries MUST pass validation
-(non-negative `in`/`out`, `tokenizer` present). Tests MUST assert exit codes
-and merge precedence deterministically.
+(per-unit price fields present and non-negative; `tokenizer` present on
+per-token model entries). Tests MUST assert exit codes and merge precedence
+deterministically, and MUST pin the clock wherever attestation expiry is exercised.
 
 ## Data & Schema Constraints
 
 The cache envelope MUST carry exactly these keys:
 
 <!-- contract:begin envelope -->
-Cache envelope keys: `fetched_at`, `freshness`, `models`, `needs_review`, `ttl_hours`.
+Cache envelope keys: `deployments`, `fetched_at`, `freshness`, `models`, `needs_review`, `ttl_hours`.
 <!-- contract:end envelope -->
 
+Every price MUST carry a `unit` from this vocabulary, and a unit's price fields
+MUST NOT be reused for another unit — a per-page price never appears in `in`/`out`:
+
+<!-- contract:begin units -->
+| unit | price fields | one unit buys |
+|---|---|---|
+| `per_1m_tokens` | `in`, `out` | one million input / output tokens |
+| `per_page` | `price` | one page processed |
+| `per_run` | `price` | one request / invocation |
+| `per_gpu_hour` | `usd_per_hour` | one hour of the named GPU |
+| `per_month` | `price` | one month, flat -- cost per unit of work needs a volume |
+
+Per-token prices are USD per 1M tokens. A unit's fields are never reused for another unit, so a consumer that multiplies `in`/`out` by a token count cannot pick up a per-page price by mistake.
+<!-- contract:end units -->
+
 `fetched_at` is ISO-8601 UTC. `freshness` reports age only and
-MUST NOT be read as a correctness signal; `needs_review` carries the ids a human
-must look at. Prices MUST be USD per 1M tokens. Cache writes MUST be atomic
-(temp file + rename), since multiple agents read these files concurrently.
-Generated cache files MUST be gitignored (regenerated on demand). The repo MUST
-NOT store secrets or PII; pricing and tokenizer mappings are the only data.
+MUST NOT be read as a correctness signal; `needs_review` carries the ids — model or
+deployment — a human must look at. Cache writes MUST be atomic (temp file + rename),
+since multiple agents read these files concurrently. Generated cache files MUST be
+gitignored (regenerated on demand). The repo MUST NOT store secrets or PII; pricing,
+tokenizer mappings, deployments and GPU rates are the only data.
 
 ## Development Workflow
 
@@ -126,4 +162,4 @@ redefinitions, MINOR for new principles or materially expanded guidance,
 PATCH for clarifications. Every change MUST verify compliance against all
 principles before merging. Runtime development guidance lives in `AGENTS.md`.
 
-**Version**: 2.0.0 | **Ratified**: 2026-08-29 | **Last Amended**: 2026-08-31
+**Version**: 3.0.0 | **Ratified**: 2026-08-29 | **Last Amended**: 2026-09-08

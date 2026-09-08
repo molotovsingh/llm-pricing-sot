@@ -35,6 +35,26 @@ ATTESTATION_MAX_AGE_DAYS = 90
 # an assumption -- it is named in the answer (`ranked_by`) rather than hidden.
 CHEAPEST_IO_RATIO = 3
 
+# What one unit of a price buys, and which fields carry it. This is the whole
+# vocabulary: any other `unit` fails validation, and a unit's fields are never
+# reused for another unit -- a per-page price must never land in `in`/`out`,
+# where a consumer would multiply it by a token count. Rendered into the
+# governed documents by tests/test_contract_drift.py; do not restate it.
+UNITS = {
+    "per_1m_tokens": {"fields": ("in", "out"),
+                      "buys": "one million input / output tokens"},
+    "per_page":      {"fields": ("price",),
+                      "buys": "one page processed"},
+    "per_run":       {"fields": ("price",),
+                      "buys": "one request / invocation"},
+    "per_gpu_hour":  {"fields": ("usd_per_hour",),
+                      "buys": "one hour of the named GPU"},
+    "per_month":     {"fields": ("price",),
+                      "buys": "one month, flat -- cost per unit of work needs a volume"},
+}
+DEFAULT_UNIT = "per_1m_tokens"
+_ALL_PRICE_FIELDS = frozenset(f for spec in UNITS.values() for f in spec["fields"])
+
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 INVOCATION_SCRIPT_DIR = _SCRIPT_DIR
 
@@ -335,18 +355,39 @@ def _is_non_negative_num(value):
     return value >= 0
 
 
-def validate_entry(entry):
-    """Return True if an emitted entry is valid (NFR-005).
+def _unit_fields_valid(entry, unit):
+    """True if `entry` carries exactly `unit`'s price fields, all non-negative.
 
-    Requires a non-empty `tokenizer` and non-negative numeric `in`/`out`.
-    Each `alternatives[]` entry must itself have non-negative `in`/`out`.
+    A field belonging to a different unit is rejected even when the unit's own
+    fields are fine: the presence of `price` on a per-token entry means someone
+    put a per-page number where a token multiplier will find it.
+    """
+    spec = UNITS.get(unit)
+    if spec is None:
+        return False
+    if not all(_is_non_negative_num(entry.get(f)) for f in spec["fields"]):
+        return False
+    foreign = _ALL_PRICE_FIELDS - set(spec["fields"])
+    return not any(f in entry for f in foreign)
+
+
+def validate_entry(entry):
+    """Return True if an emitted *model* entry is valid (NFR-005).
+
+    Model entries are per-token by definition: `unit` must be `per_1m_tokens`
+    (absent means the same -- entries written before units existed), with a
+    non-empty `tokenizer` and non-negative `in`/`out`. Other units live under
+    `deployments`, never here. Each `alternatives[]` entry must itself have
+    non-negative `in`/`out`.
     """
     if not isinstance(entry, dict):
         return False
+    if entry.get("unit", DEFAULT_UNIT) != DEFAULT_UNIT:
+        return False
+    if not _unit_fields_valid(entry, DEFAULT_UNIT):
+        return False
     tokenizer = entry.get("tokenizer")
     if not isinstance(tokenizer, str) or not tokenizer:
-        return False
-    if not _is_non_negative_num(entry.get("in")) or not _is_non_negative_num(entry.get("out")):
         return False
     catalog_row = entry.get("catalog")
     if catalog_row is not None:
@@ -403,11 +444,14 @@ def is_fresh(cache, ttl_hours=DEFAULT_TTL_HOURS, now=None):
     return age_seconds < ttl_hours * 3600
 
 
-def build_cache(models, ttl_hours, fetched_at, freshness, needs_review=None):
+def build_cache(models, ttl_hours, fetched_at, freshness, needs_review=None,
+                deployments=None):
     """Build the cache/pricing.json payload (FR-001, FR-006, FR-008).
 
     `needs_review` is a top-level roll-up so a consumer can spot an entry a human
     must look at without walking every model. `freshness` stays purely about age.
+    `deployments` is the second truth layer -- what we actually run, in its native
+    unit -- kept apart from `models`, which stay per-token.
     """
     return {
         "fetched_at": fetched_at,
@@ -415,6 +459,7 @@ def build_cache(models, ttl_hours, fetched_at, freshness, needs_review=None):
         "freshness": freshness,
         "needs_review": sorted(needs_review or []),
         "models": models,
+        "deployments": deployments or {},
     }
 
 
@@ -523,6 +568,12 @@ def run(ttl_hours=DEFAULT_TTL_HOURS, force=False,
                                         openrouter_layer, litellm_layer, now=now)
     layers = [layer for layer in (openrouter_layer, litellm_layer, overrides) if layer]
     merged = merge(layers) if layers else {}
+    # Every emitted price names what one unit of it buys (FR-001). Model entries
+    # are per-token by definition; the stamp is what lets validation reject a
+    # non-token price that strays into this layer.
+    for entry in merged.values():
+        if isinstance(entry, dict):
+            entry.setdefault("unit", DEFAULT_UNIT)
 
     if not catalog_unavailable:
         valid = filter_valid(merged)
@@ -890,6 +941,7 @@ def _query_review(ctx):
 def _query_list(ctx):
     """`query list` -- tracked models first, then discovery as baseline rows."""
     models = [{"model": mid, "in": e.get("in"), "out": e.get("out"),
+               "unit": e.get("unit", DEFAULT_UNIT),
                "source": e.get("source"), "baseline": False}
               for mid, e in ctx.models.items()]
     if ctx.discovery is not None:
@@ -898,6 +950,7 @@ def _query_list(ctx):
                 if mid in ctx.models:
                     continue
                 models.append({"model": mid, "in": e.get("in"), "out": e.get("out"),
+                               "unit": DEFAULT_UNIT,
                                "source": layer_name, "baseline": True})
     status = ctx.freshness if ctx.freshness != "no-data" else ctx.discovery_freshness
     return ctx.out({"freshness": ctx.freshness, "models": models}, status, bool(ctx.flagged))
@@ -914,14 +967,14 @@ def _query_price(ctx, model):
         for _, layer in ctx.layers():
             if model in layer:
                 entry = dict(layer[model])
-                entry.update({"model": model, "baseline": True,
+                entry.update({"model": model, "baseline": True, "unit": DEFAULT_UNIT,
                               "freshness": ctx.discovery_freshness})
                 return ctx.out(entry, ctx.discovery_freshness)
         for _, layer in ctx.layers():
             for mid, e in layer.items():
                 if _variant_matches(model, mid):
                     entry = dict(e)
-                    entry.update({"model": mid, "baseline": True,
+                    entry.update({"model": mid, "baseline": True, "unit": DEFAULT_UNIT,
                                   "freshness": ctx.discovery_freshness})
                     return ctx.out(entry, ctx.discovery_freshness)
     return ctx.out({"model": model, "found": False, "freshness": ctx.freshness}, "no-data")
@@ -952,7 +1005,7 @@ def _cheapest_by_endpoint(ctx, model, authoritative, degraded):
                "provider_tag": cheapest.get("provider_tag"),
                "quantization": cheapest.get("quantization"),
                "in": cheapest.get("in"), "out": cheapest.get("out"),
-               "source": "openrouter-endpoints", "baseline": True,
+               "source": "openrouter-endpoints", "baseline": True, "unit": DEFAULT_UNIT,
                "authoritative": authoritative, "variants": len(eps),
                "freshness": ep_freshness}
     if "in_cache_read" in cheapest:
@@ -982,7 +1035,7 @@ def _query_cheapest(ctx, model):
     cheapest = min(variants, key=_blended_cost)
     return ctx.out({"model": model, "provider": cheapest["provider"], "in": cheapest["in"],
                     "out": cheapest["out"], "source": cheapest["source"], "baseline": True,
-                    "fallback": True, "authoritative": authoritative,
+                    "unit": DEFAULT_UNIT, "fallback": True, "authoritative": authoritative,
                     "ranked_by": f"blended-{CHEAPEST_IO_RATIO}:1",
                     "variants": len(variants), "freshness": ctx.discovery_freshness},
                    ctx.discovery_freshness, degraded)

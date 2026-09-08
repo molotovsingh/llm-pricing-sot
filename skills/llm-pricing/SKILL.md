@@ -33,7 +33,20 @@ python ~/llm/llm-pricing-sot/fetch_pricing.py --force    # force a full refresh
 
 ## Reading the answer
 
-Prices are USD per 1M tokens. One JSON object on stdout; human notes on stderr.
+One JSON object on stdout; human notes on stderr. **Every price names its `unit`** —
+read it before doing arithmetic; a per-page price is not a token price:
+
+<!-- contract:begin units -->
+| unit | price fields | one unit buys |
+|---|---|---|
+| `per_1m_tokens` | `in`, `out` | one million input / output tokens |
+| `per_page` | `price` | one page processed |
+| `per_run` | `price` | one request / invocation |
+| `per_gpu_hour` | `usd_per_hour` | one hour of the named GPU |
+| `per_month` | `price` | one month, flat -- cost per unit of work needs a volume |
+
+Per-token prices are USD per 1M tokens. A unit's fields are never reused for another unit, so a consumer that multiplies `in`/`out` by a token count cannot pick up a per-page price by mistake.
+<!-- contract:end units -->
 
 **Is this a price I can use?** Read `baseline`, not `source`:
 
