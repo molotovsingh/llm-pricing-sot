@@ -103,6 +103,10 @@ def is_historical(rel_path):
 # Block recognition (research.md R5)
 # --------------------------------------------------------------------------
 
+# CommonMark allows both fence characters. Matching only ``` would let a
+# ~~~-fenced example toggle nothing, so a marker inside it would count as real.
+_FENCE_RE = re.compile(r"^\s*(?:```|~~~)")
+
 BEGIN_RE = re.compile(r"^<!-- contract:begin ([A-Za-z0-9_-]+) -->$")
 END_RE = re.compile(r"^<!-- contract:end ([A-Za-z0-9_-]+) -->$")
 
@@ -123,7 +127,7 @@ def find_blocks(text):
     """
     blocks, fenced, open_id, body = {}, False, None, []
     for lineno, line in enumerate(text.splitlines(), 1):
-        if line.lstrip().startswith("```"):
+        if _FENCE_RE.match(line):
             fenced = not fenced
             if open_id is not None:
                 body.append(line)
@@ -177,7 +181,7 @@ def rewrite_blocks(text):
     """Return text with every recognised block replaced by its canonical body."""
     out, fenced, open_id = [], False, None
     for line in text.splitlines():
-        if line.lstrip().startswith("```"):
+        if _FENCE_RE.match(line):
             fenced = not fenced
             if open_id is None:
                 out.append(line)
@@ -398,6 +402,15 @@ class TestBlockRecognition(unittest.TestCase):
     def test_ignores_marker_inside_code_fence(self):
         self.assertEqual(find_blocks("```markdown\n" + self.CANON + "\n```"), {})
 
+    def test_ignores_marker_inside_tilde_fence(self):
+        # CommonMark allows ~~~ as well; a doc using it must not smuggle a
+        # marker past the gate (or swallow a real one by never toggling).
+        self.assertEqual(find_blocks("~~~markdown\n" + self.CANON + "\n~~~"), {})
+
+    def test_tilde_fence_does_not_swallow_a_later_real_block(self):
+        text = "~~~\nexample\n~~~\n\n" + self.CANON
+        self.assertEqual(find_blocks(text), {"envelope": "body"})
+
     def test_placeholder_id_is_not_a_marker(self):
         self.assertEqual(find_blocks("<!-- contract:begin <fact-id> -->"), {})
 
@@ -432,6 +445,53 @@ class TestFactsDerivedFromCode(unittest.TestCase):
         for fact_id, render in FACTS.items():
             with self.subTest(fact=fact_id):
                 self.assertEqual(render(), render())
+
+
+class TestSourceDoesNotRestateExitCodes(unittest.TestCase):
+    """The gate governs documents; nothing governed the source's own docstrings.
+
+    `run` and `query_main` each carried an exit-code mapping that went stale when
+    degradation became first-class -- inside the very file the facts are derived
+    from. A marker block cannot live in a docstring, so source prose is governed
+    by *absence*: reference `_exit_for`, never restate it.
+    """
+
+    # Every restatement was written as "<code> <freshness-word>": "0 fresh",
+    # "1 stale cache served", "2 no data / not found".
+    RESTATEMENT = re.compile(
+        r"\b[012]\b[^.\n]{0,40}?\b(fresh|stale|no[- ]data|no usable)", re.IGNORECASE)
+    # `_exit_for` *is* the source, and the module docstring names the schema.
+    ALLOWED = {"_exit_for"}
+
+    def _offenders(self, source):
+        found = []
+        for node in ast.walk(ast.parse(source)):
+            if not isinstance(node, (ast.Module, ast.ClassDef,
+                                     ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            name = getattr(node, "name", "<module>")
+            if name in self.ALLOWED:
+                continue
+            doc = ast.get_docstring(node) or ""
+            hit = self.RESTATEMENT.search(doc)
+            if hit:
+                found.append((name, hit.group(0)))
+        return sorted(found)
+
+    def test_no_docstring_restates_the_exit_mapping(self):
+        source = (REPO_ROOT / "fetch_pricing.py").read_text(encoding="utf-8")
+        self.assertEqual(
+            self._offenders(source), [],
+            "exit-code mapping restated in a docstring -- reference `_exit_for` instead")
+
+    def test_the_guard_actually_catches_a_restatement(self):
+        """A guard that cannot fail is decoration; prove it fires."""
+        stale = ('"""Module."""\n\n'
+                 'def run():\n'
+                 '    """Do work.\n\n'
+                 '    Exit codes: 0 fresh, 1 stale cache served, 2 no usable cache.\n'
+                 '    """\n')
+        self.assertEqual([n for n, _ in self._offenders(stale)], ["run"])
 
 
 class TestTrustRuleHoldsOperationally(unittest.TestCase):

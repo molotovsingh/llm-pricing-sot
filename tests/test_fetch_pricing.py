@@ -41,6 +41,7 @@ from fetch_pricing import (
     _resolve_slug,
     _normalize_model,
     _normalize_openrouter,
+    _parse_iso_utc,
 )
 
 
@@ -1311,10 +1312,40 @@ class TestShippedOverridesFile(unittest.TestCase):
         # Deliberately unattested is a tracked state (needs_review handles it).
         # A *partial* attestation is not a policy choice, it is a mistake: the
         # price is silently discarded while the file looks like it was claimed.
+        #
+        # Shape only, deliberately. Whether an attestation has aged out is a
+        # function of *when the suite runs*, and the pipeline already reports it
+        # as `review: attestation-expired` (see the test below). Asserting
+        # freshness here would turn a re-confirm-the-rate prompt into a suite
+        # failure on a date, with no code change -- which is exactly what this
+        # repo reports rather than raises everywhere else.
         for mid, entry in self.entries.items():
             declared = [k for k in ("negotiated", "note", "verified_at") if k in entry]
             if declared:
                 with self.subTest(model=mid):
                     self.assertEqual(len(declared), 3,
                                      f"partial attestation: only {declared}")
-                    self.assertEqual(attestation_state(entry), "valid")
+                    self.assertIs(entry["negotiated"], True)
+                    self.assertTrue(str(entry["note"]).strip(), "empty note")
+                    self.assertIsNotNone(_parse_iso_utc(entry["verified_at"]),
+                                         "verified_at must be a parseable ISO date")
+
+    def test_attestation_expiry_is_reported_not_fatal(self):
+        """An aged-out attestation reaches `needs_review`; it never fails a run.
+
+        The clock is pinned per entry rather than read, so this asserts the
+        *mechanism* and behaves identically whenever it runs.
+        """
+        attested = {mid: e for mid, e in self.entries.items()
+                    if e.get("negotiated") is True}
+        self.assertTrue(attested, "no attested entry to exercise the mechanism")
+        for mid, entry in attested.items():
+            aged = _parse_iso_utc(entry["verified_at"]) + timedelta(
+                days=ATTESTATION_MAX_AGE_DAYS + 1)
+            with self.subTest(model=mid):
+                self.assertEqual(attestation_state(entry, now=aged), "expired")
+                linked = attach_catalog_baseline(
+                    {mid: dict(entry)},
+                    {entry["openrouter_slug"]: {"in": 1.0, "out": 2.0}},
+                    {}, now=aged)
+                self.assertEqual(linked[mid].get("review"), "attestation-expired")

@@ -7,8 +7,9 @@ cd "$(dirname "$0")"
 # plus smoke of every offline read action. Suppress success noise.
 python3 -m unittest discover -s tests 2>&1 | tail -15
 
-# Offline smoke. Exit-code contract (FR-008): 0 fresh, 1 stale/degraded,
-# 2 = no data / not found = failure. JSON must always parse.
+# Offline smoke. The exit-code contract (FR-008) is generated into README.md
+# from `_exit_for` -- read it there rather than trusting a copy in this comment,
+# which is exactly how it drifted before. JSON must always parse.
 # The review queue is empty: every model either inherits a catalog price or
 # carries an attestation, so `list`/`fresh` exit 0. If one of these starts
 # exiting 1, a price went unattested or a pin stopped resolving — investigate

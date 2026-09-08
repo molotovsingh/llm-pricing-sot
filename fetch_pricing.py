@@ -477,8 +477,11 @@ def run(ttl_hours=DEFAULT_TTL_HOURS, force=False,
         now=None):
     """Orchestrate fetch -> merge -> emit, returning an exit code.
 
-    Exit codes (FR-004/FR-005, NFR-003/NFR-004): 0 fresh (cache-hit or refresh),
-    1 stale cache served, 2 no usable cache.
+    Exit codes (FR-004/FR-005, NFR-003/NFR-004) follow `_exit_for`, the single
+    source for the whole vocabulary -- including the degraded case this function
+    returns for flagged entries. The mapping is deliberately NOT restated here:
+    the copy that used to live in this docstring described only the age-based
+    outcome, long after this function also began signalling degradation.
     """
     cache = _load_cache(cache_path)
 
@@ -770,7 +773,8 @@ def query_main(args, openrouter_fetcher=_default_fetcher, litellm_fetcher=_defau
                discovery_path=DISCOVERY_PATH, endpoints_dir=ENDPOINTS_CACHE_DIR):
     """Run a `query` subcommand. Prints JSON to stdout; returns an exit code.
 
-    Exit codes (FR-008): 0 fresh answer, 1 stale answer, 2 no data / not found.
+    Exit codes (FR-008) follow `_exit_for`, which maps freshness *and*
+    degradation. Deliberately not restated here -- see `tests/test_contract_drift.py`.
     """
     offline = bool(getattr(args, "offline", False))
     action = args.action
