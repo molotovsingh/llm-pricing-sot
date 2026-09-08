@@ -118,7 +118,7 @@ cold-start unchanged.
       `price --host`.
 - [x] T031 Acceptance: `uv run` the estimator end-to-end (SC-003); cold-start ruler
       (`autoresearch.sh` bench) within noise of 34 ms.
-- [ ] T032 `claude_review/` delta report at the final commit.
+- [x] T032 `claude_review/` delta report at the final commit.
 
 ## Dependencies
 
