@@ -14,7 +14,7 @@ Pricing changes weekly-to-monthly. Fetching on a timer re-fetches for zero diff 
 
 ```
 agent needs cost → run fetch_pricing.py
-  ├─ cache fresh (< TTL, default 24h)?  → read cache (zero network, instant)
+  ├─ cache fresh (< TTL, default 7d)?  → read cache (zero network, instant)
   ├─ stale or missing?                   → fetch sources → merge → write cache
   └─ network fails?                      → serve stale cache + "STALE" flag
 ```
@@ -51,7 +51,7 @@ Optional later upgrade: a keep-warm cron that calls the *same script* daily (pre
 
 Every consumer reads the **same file**: `<repo>/cache/pricing.json` (repo-local).
 
-**Schema you read:** `{ "fetched_at": "<ISO-8601 UTC>", "ttl_hours": 24, "freshness": "fresh", "needs_review": ["<model_id>", ...], "models": { "<model_id>": { "in": <$/1M>, "out": <$/1M>, "tokenizer": "...", "fallback" (optional), "source": "override"|"openrouter"|"litellm", "catalog" (optional), "drift" (optional), "review" (optional) } } }`. Prices are USD per 1M tokens.
+**Schema you read:** `{ "fetched_at": "<ISO-8601 UTC>", "ttl_hours": 168, "freshness": "fresh", "needs_review": ["<model_id>", ...], "models": { "<model_id>": { "in": <$/1M>, "out": <$/1M>, "tokenizer": "...", "fallback" (optional), "source": "override"|"openrouter"|"litellm", "catalog" (optional), "drift" (optional), "review" (optional) } } }`. Prices are USD per 1M tokens.
 
 The envelope keys are fixed:
 
@@ -132,7 +132,7 @@ gpt-5.6-sol            5.0/30.0        2.0/10.0  unattested-price-ignored
 The table goes to stderr; stdout stays machine-readable JSON like every other query.
 
 `--ttl-hours` applies to queries too (`fetch_pricing.py --ttl-hours 1 query price <model>`),
-so a cost-critical run can demand a tighter freshness window than the 24h default. It gates
+so a cost-critical run can demand a tighter freshness window than the 7-day default. It gates
 what *that* caller sees and is never stamped into the shared envelope — persisting it would
 change every other consumer's refresh cadence.
 

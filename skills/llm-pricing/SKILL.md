@@ -22,7 +22,7 @@ python ~/llm/llm-pricing-sot/fetch_pricing.py query review   # entries a human m
 
 Append `--offline` to any query to guarantee zero network (serves cached/stale data
 or reports "not found"). Prefix `--ttl-hours N` to demand a tighter freshness window
-than the 24h default, e.g. `--ttl-hours 1 query price gpt-5.2`.
+than the 7-day default, e.g. `--ttl-hours 1 query price gpt-5.2`.
 
 ## Refresh (network)
 

@@ -15,7 +15,11 @@ import re
 import sys
 from datetime import datetime, timezone
 
-DEFAULT_TTL_HOURS = 24
+# How long fetched data -- pricing, discovery, endpoint snapshots -- counts as
+# fresh. One week. A consumer needing tighter passes --ttl-hours, which is a
+# read-time gate for that caller only and is never stamped into the shared
+# envelope (see _refresh_cache_if_stale).
+DEFAULT_TTL_HOURS = 168
 
 # Relative divergence between an override and its catalog baseline above which
 # the override is flagged as drifted.

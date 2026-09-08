@@ -44,6 +44,12 @@ from fetch_pricing import (
     _parse_iso_utc,
 )
 
+# Comfortably past the freshness gate, whatever DEFAULT_TTL_HOURS is. These
+# fixtures used a hardcoded 48h, which silently became *fresh* when the default
+# moved from a day to a week -- the age a test calls "stale" has a single source
+# like everything else here.
+STALE_HOURS = DEFAULT_TTL_HOURS * 2
+
 
 class TestParseArgs(unittest.TestCase):
     def test_defaults(self):
@@ -552,7 +558,7 @@ class TestRunOrchestration(unittest.TestCase):
         self.assertEqual(cache["models"]["only"]["review"], "unverifiable-price")
 
     def test_source_failure_serves_stale_exit1(self):
-        self._write_cache(48, freshness="fresh")
+        self._write_cache(STALE_HOURS, freshness="fresh")
         code = run(
             cache_path=self.cache_path, overrides_path=self.overrides_path,
             openrouter_fetcher=self._raising_fetcher,
@@ -694,7 +700,7 @@ class TestQueryPrice(QueryTestBase):
         self.assertFalse(data["found"])
 
     def test_stale_cache_served_offline_exit1(self):
-        self._write_cache(48)
+        self._write_cache(STALE_HOURS)
         code, data = self._run("price", "kimi-k3", offline=True)
         self.assertEqual(code, 1)
         self.assertEqual(data["freshness"], "stale")
@@ -752,10 +758,10 @@ class TestQueryListFresh(QueryTestBase):
         code, data = self._run("fresh", offline=True)
         self.assertEqual(code, 0)
         self.assertEqual(data["freshness"], "fresh")
-        self.assertEqual(data["ttl_hours"], 24)
+        self.assertEqual(data["ttl_hours"], DEFAULT_TTL_HOURS)
 
     def test_fresh_stale_exit1(self):
-        self._write_cache(48)
+        self._write_cache(STALE_HOURS)
         code, data = self._run("fresh", offline=True)
         self.assertEqual(code, 1)
         self.assertEqual(data["freshness"], "stale")
@@ -856,7 +862,7 @@ class TestEndpointsCheapest(QueryTestBase):
         self._k3_catalog_sidecar()
         path = _endpoint_snapshot_path("moonshotai/kimi-k3", self.endpoints_dir)
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        snap = {"fetched_at": (self.now - timedelta(hours=48)).isoformat(), "ttl_hours": 24,
+        snap = {"fetched_at": (self.now - timedelta(hours=STALE_HOURS)).isoformat(), "ttl_hours": 24,
                 "slug": "moonshotai/kimi-k3",
                 "endpoints": [{"provider_name": "Makora", "tag": "makora", "quantization": "unknown",
                                 "in": 2.55, "out": 12.75}]}
