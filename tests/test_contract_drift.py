@@ -21,6 +21,8 @@ import json
 import os
 import pathlib
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -391,8 +393,8 @@ class TestGateFailsOnDrift(unittest.TestCase):
                             "a corrupted block must not compare equal")
 
     def test_prose_outside_markers_may_be_reworded(self):
-        reworded = self.original.replace(
-            "Single source of truth repo", "Single source-of-truth repository")
+        # Add unrelated prose without depending on an incidental sentence in the skill.
+        reworded = self.original + "\nEditorial note outside all contract blocks.\n"
         self.assertNotEqual(reworded, self.original, "fixture did not actually change anything")
         for fact_id, body in find_blocks(reworded).items():
             with self.subTest(fact=fact_id):
@@ -634,37 +636,45 @@ class TestGenerator(unittest.TestCase):
                               f"the __main__ guard")
 
 
-class TestSkillSymlinkIsGoverned(unittest.TestCase):
-    """The governed file should be the one agents actually load.
+class TestSkillPackageIsGoverned(unittest.TestCase):
+    """The native package exposes the governed skill with its executable inputs.
 
-    Only the installed checkout can assert this. Any other clone skips loudly
-    rather than failing -- a secondary checkout is legitimate, and failing there
-    would break CI and every contributor's copy.
+    No assertion depends on this machine's installed Pi configuration. A local
+    package uses the canonical checkout; a git package is a managed installation
+    of that same source, not an independently maintained skill copy.
     """
 
-    INSTALLED = pathlib.Path.home() / ".pi" / "agent" / "skills" / "llm-pricing"
+    def test_package_exposes_the_governed_skill(self):
+        manifest = json.loads((REPO_ROOT / "package.json").read_text(encoding="utf-8"))
+        exposed = [(REPO_ROOT / entry / "SKILL.md").resolve()
+                   for entry in manifest["pi"]["skills"]]
+        self.assertEqual(exposed, [(REPO_ROOT / "skills/llm-pricing/SKILL.md").resolve()])
 
-    def _skip_loudly(self, reason):
-        print(f"\n[contract] symlink unverified: {reason}", file=sys.stderr)
-        self.skipTest(reason)
-
-    def test_installed_skill_is_a_link_not_a_copy(self):
-        if not self.INSTALLED.exists():
-            self._skip_loudly("~/.pi/agent/skills/llm-pricing absent; agent harness "
-                              "not installed on this machine")
-        self.assertTrue(self.INSTALLED.is_symlink(),
-                        "the installed skill is a copy, not a link -- it will drift "
-                        "from the governed file the moment either is edited")
-
-    def test_installed_skill_resolves_into_this_repo(self):
-        if not self.INSTALLED.exists():
-            self._skip_loudly("agent harness not installed on this machine")
-        target = self.INSTALLED.resolve()
-        ours = (REPO_ROOT / "skills" / "llm-pricing").resolve()
-        if target != ours:
-            self._skip_loudly(f"this checkout is not the installed one "
-                              f"({target} is); nothing to assert here")
-        self.assertEqual(target, ours)
+    def test_relocated_package_runs_without_home_checkout_or_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            installed = root / "managed-package"
+            shutil.copytree(REPO_ROOT, installed,
+                            ignore=shutil.ignore_patterns(".git", "cache", "__pycache__"))
+            home = root / "empty-home"
+            home.mkdir()
+            # Derive the root from the delivered skill, not a developer's ~/llm tree.
+            manifest = json.loads((installed / "package.json").read_text(encoding="utf-8"))
+            skill = installed / manifest["pi"]["skills"][0] / "SKILL.md"
+            package_root = skill.parent.parent.parent
+            self.assertFalse((package_root / "cache").exists())
+            completed = subprocess.run(
+                [sys.executable, str(package_root / "fetch_pricing.py"),
+                 "query", "deployments", "--offline"],
+                cwd=home, env={**os.environ, "HOME": str(home)},
+                capture_output=True, text=True, timeout=15,
+            )
+            # A fresh package has no cached catalog: offline is a structured
+            # no-data response, not a missing script, guessed path or traceback.
+            self.assertEqual(completed.returncode, 2, completed.stderr)
+            result = json.loads(completed.stdout)
+            self.assertEqual(result["freshness"], "no-data")
+            self.assertEqual(result["deployments"], [])
 
 
 class TestCheckerIsHermetic(unittest.TestCase):

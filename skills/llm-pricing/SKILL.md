@@ -1,6 +1,6 @@
 ---
 name: llm-pricing
-description: Get current LLM pricing from the single source of truth at ~/llm/llm-pricing-sot.
+description: Get current LLM pricing from the llm-pricing-sot package's single source of truth.
   Use when you need a model's price, its price at a specific host (Together, Baseten, ...),
   every host that serves it, the cheapest host, what we actually run (deployments, including
   self-hosted models priced per page), the model list, or pricing freshness; to refresh
@@ -10,20 +10,32 @@ description: Get current LLM pricing from the single source of truth at ~/llm/ll
 
 # LLM Pricing
 
-Single source of truth repo: `~/llm/llm-pricing-sot` (stdlib-only Python, no install).
+The authoritative source is the `llm-pricing-sot` repository. This skill ships
+with its pipeline and tracked inputs as a native Pi package (Python 3.9+, stdlib
+only, no pip install). Do not create a separate copy of just this skill.
+
+Resolve `PRICING_ROOT` to the package root **two directory levels above the directory
+containing this `SKILL.md`**, using the actual skill location supplied by Pi. Use that
+absolute path in each command; do not assume a home-directory checkout or the current
+working directory. Set the variable again when commands run in separate shells.
+The pipeline already resolves its inputs/cache relative to its script.
+On a fresh install the cache is empty: an offline query may correctly report no data.
+Online queries populate it from public sources; tracked overrides and deployments
+are included in the package. Edit maintained inputs in the source checkout and
+commit them there, not independently in managed installations.
 
 ## Queries (auto-refresh when data is stale)
 
 ```bash
-python ~/llm/llm-pricing-sot/fetch_pricing.py query price <model>
-python ~/llm/llm-pricing-sot/fetch_pricing.py query cheapest <model>
-python ~/llm/llm-pricing-sot/fetch_pricing.py query list
-python ~/llm/llm-pricing-sot/fetch_pricing.py query fresh
-python ~/llm/llm-pricing-sot/fetch_pricing.py query review   # entries a human must resolve
-python ~/llm/llm-pricing-sot/fetch_pricing.py query hosts <model>            # every host serving it, cheapest first
-python ~/llm/llm-pricing-sot/fetch_pricing.py query price <model> --host <h> # the price AT that host
-python ~/llm/llm-pricing-sot/fetch_pricing.py query cheapest <model> --host <h>
-python ~/llm/llm-pricing-sot/fetch_pricing.py query deployments              # what we actually run
+python3 "$PRICING_ROOT/fetch_pricing.py" query price <model>
+python3 "$PRICING_ROOT/fetch_pricing.py" query cheapest <model>
+python3 "$PRICING_ROOT/fetch_pricing.py" query list
+python3 "$PRICING_ROOT/fetch_pricing.py" query fresh
+python3 "$PRICING_ROOT/fetch_pricing.py" query review   # entries a human must resolve
+python3 "$PRICING_ROOT/fetch_pricing.py" query hosts <model>            # every host serving it, cheapest first
+python3 "$PRICING_ROOT/fetch_pricing.py" query price <model> --host <h> # the price AT that host
+python3 "$PRICING_ROOT/fetch_pricing.py" query cheapest <model> --host <h>
+python3 "$PRICING_ROOT/fetch_pricing.py" query deployments              # what we actually run
 ```
 
 Append `--offline` to any query to guarantee zero network (serves cached/stale data
@@ -50,8 +62,8 @@ self-hosted entry is priced `per_page` from a GPU rate and a benchmark measureme
 ## Refresh (network)
 
 ```bash
-python ~/llm/llm-pricing-sot/fetch_pricing.py            # refresh when stale
-python ~/llm/llm-pricing-sot/fetch_pricing.py --force    # force a full refresh
+python3 "$PRICING_ROOT/fetch_pricing.py"            # refresh when stale
+python3 "$PRICING_ROOT/fetch_pricing.py" --force    # force a full refresh
 ```
 
 ## Reading the answer
@@ -111,11 +123,18 @@ Exit 1 is not only staleness — do not report it as "stale data" without checki
 The answer is usable; say it is degraded rather than presenting it as certain. Run
 `query review` to see which entries need attention and why.
 
-## Cost estimate for a call
+## Cost estimate for a call (optional separate tool)
+
+The cost estimator is not bundled with this package. If a checkout of
+`molotovsingh/llm-cost-estimator` is available, resolve its actual local path
+(`ESTIMATOR_ROOT`) and run:
 
 ```bash
-~/llm/llm-cost-estimator/estimate_llm_cost.py --pricing-dir ~/llm/llm-pricing-sot <file> [--max-tokens N] [--models m1,m2]
+python3 "$ESTIMATOR_ROOT/estimate_llm_cost.py" --pricing-dir "$PRICING_ROOT" <file> [--max-tokens N] [--models m1,m2]
 ```
+
+If it is absent, report this optional dependency rather than invoking a guessed path.
+Pricing queries above do not depend on it.
 
 ## OpenRouter account lookups (interactive only)
 

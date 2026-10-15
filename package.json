@@ -1,0 +1,13 @@
+{
+  "name": "pi-llm-pricing",
+  "version": "0.1.0",
+  "private": true,
+  "description": "LLM pricing skill with its stdlib Python pipeline and tracked pricing inputs.",
+  "keywords": ["pi-package"],
+  "pi": {
+    "skills": ["./skills/llm-pricing"],
+    "extensions": [],
+    "prompts": [],
+    "themes": []
+  }
+}

@@ -4,6 +4,23 @@ Single source of truth for LLM pricing, shared by Hermes, Pi, and `llm-cost-esti
 
 **Status: pipeline built; consumer wiring documented.** `fetch_pricing.py`, `overrides.json`, and `cache/pricing.json` exist; the stdlib-only CLI fetches on demand, merges by precedence (overrides > OpenRouter catalog > LiteLLM), prices **what you actually run** from `deployments.json` in its native unit, and emits a TTL-gated cache with freshness metadata. Consumers are wired per the contract below.
 
+## Install the Pi skill
+
+This repository is a native Pi package that includes the skill, Python pipeline,
+and tracked pricing inputs together:
+
+```bash
+pi install git:github.com/molotovsingh/llm-pricing-sot
+```
+
+For development, install your existing checkout as a local Pi package instead.
+Use only one of the local/git sources on a machine; do not copy `SKILL.md` into
+another skills folder. Commands in the skill resolve the package root from its
+installed location, not a fixed home path. Python 3.9+ is required; no pip/npm
+runtime dependencies are needed. Cache files remain machine-local and are populated
+on demand; an offline query on a new install can report no cached data.
+`llm-cost-estimator` is an optional, separately installed companion tool.
+
 ## Problem
 
 LLM pricing is a dynamic parameter. Hand-maintained price tables (`llm-cost-estimator/data/pricing.json` today) drift from reality. We want one refresh mechanism that keeps prices fresh, readable by both agent harnesses (Hermes, Pi) at decision time.
